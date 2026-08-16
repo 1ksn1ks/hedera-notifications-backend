@@ -1,0 +1,2 @@
+import*as o from"@hiero-ledger/proto";class t{constructor(o){this.major=o.major,this.minor=o.minor,this.patch=o.patch,Object.freeze(this)}static _fromProtobuf(o){return new t({major:o.major,minor:o.minor,patch:o.patch})}_toProtobuf(){return{major:this.major,minor:this.minor,patch:this.patch}}static fromBytes(r){return t._fromProtobuf(o.proto.SemanticVersion.decode(r))}toBytes(){return o.proto.SemanticVersion.encode(this._toProtobuf()).finish()}}export{t as default};
+//# sourceMappingURL=SemanticVersion.js.map

@@ -1,0 +1,2 @@
+import r from"./ManagedNode.js";class t extends r{constructor(r={}){super(r)}getKey(){return this._address.toString()}get mirrorRestApiBaseUrl(){const r=this.address.address,t=this.address.port;if(!r||!t)throw new Error("Mirror node has invalid address configuration");if("localhost"===r||"127.0.0.1"===r)return`http://${r}:5551/api/v1`;return`${this._getSchemeFromHostAndPort(r,t)}://${r}:${t}/api/v1`}_getSchemeFromHostAndPort(r,t){return"localhost"===r||"127.0.0.1"===r||80===t?"http":"https"}}export{t as default};
+//# sourceMappingURL=MirrorNode.js.map
