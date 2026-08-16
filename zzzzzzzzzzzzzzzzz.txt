@@ -1,1 +1,15 @@
 npm run dev
+
+༼ ◕_◕ ゞ༽
+
+git add .
+git commit -m "your message here"
+git push
+
+༼ ◕_◕ ゞ༽
+
+git add .
+git commit -m "update"
+git push
+
+༼ ◕_◕ ゞ༽
