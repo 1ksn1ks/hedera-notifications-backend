@@ -151,76 +151,106 @@ class TopicPoller {
 
   async processMessage(topicId, msg) {
     const msgContent = Buffer.from(msg.message, 'base64').toString('utf8');
-    const payer = msg.payer_account_id || 'Unknown';
-
-    const username = await usernameService.getUsername(payer);
-    const sender = username || payer;
-
-    console.log(`📨 New message on ${topicId} from ${sender}: ${msgContent.substring(0, 80)}...`);
-
+    const payer = msg.payer_account_id || null;
+  
+    // Resolve username
+    const username = payer ? await usernameService.getUsername(payer) : null;
+  
+    // Nice display name for logs and notifications
+    let displaySender;
+    if (username && payer) {
+      displaySender = `${username} (${payer})`;
+    } else if (username) {
+      displaySender = username;
+    } else if (payer) {
+      displaySender = payer;
+    } else {
+      displaySender = 'Unknown';
+    }
+  
+    console.log(`📨 New message on ${topicId} from ${displaySender}: ${msgContent.substring(0, 80)}...`);
+  
     let cleanMessage = msgContent;
     try {
       const parsed = JSON.parse(msgContent);
       if (parsed.userMessage) cleanMessage = parsed.userMessage;
     } catch (e) {}
-
+  
     const { data: subscribers } = await supabase
       .from('topic_subscriptions')
       .select(
         'device_token, wallet_address, show_full_message, allowed_senders, blocked_senders, filter_mode'
       )
       .eq('topic_id', topicId);
-
+  
     if (!subscribers || subscribers.length === 0) return;
-
+  
     for (const sub of subscribers) {
       const mode = sub.filter_mode || 'all';
       const allowed = sub.allowed_senders || [];
       const blocked = sub.blocked_senders || [];
-
+  
+      // Filtering
       if (mode === 'allowlist') {
         const isAllowed =
-          allowed.includes(payer) ||
+          (payer && allowed.includes(payer)) ||
           (username && allowed.includes(username));
-
+  
         if (!isAllowed) {
-          console.log(`Skipping ${sub.device_token} - ${sender} not in allow list`);
+          console.log(`Skipping ${sub.device_token} - ${displaySender} not in allow list`);
           continue;
         }
       }
-
+  
       if (mode === 'blocklist') {
         const isBlocked =
-          blocked.includes(payer) ||
+          (payer && blocked.includes(payer)) ||
           (username && blocked.includes(username));
-
+  
         if (isBlocked) {
-          console.log(`Skipping ${sub.device_token} - ${sender} is blocked`);
+          console.log(`Skipping ${sub.device_token} - ${displaySender} is blocked`);
           continue;
         }
       }
-
-      // Personal feed (per wallet)
+  
+      // Save to personal feed
       if (sub.wallet_address) {
         const { error: insertError } = await supabase.from('user_messages').insert({
           wallet_address: sub.wallet_address,
           topic_id: topicId,
-          sender: sender,
+          payer: payer,
+          sender: username,
           body: cleanMessage,
           sequence_number: msg.sequence_number ?? null,
         });
-
+  
         if (insertError) {
           console.log('user_messages insert error:', insertError.message);
         }
       }
-
-      const body = sub.show_full_message
-        ? `${sender}: ${cleanMessage.length > 100 ? cleanMessage.substring(0, 97) + '...' : cleanMessage}`
-        : `New message from ${sender}`;
-
+  
+      // Build notification body
+      const notificationBody = sub.show_full_message
+        ? `${displaySender}: ${
+            cleanMessage.length > 100
+              ? cleanMessage.substring(0, 97) + '...'
+              : cleanMessage
+          }`
+        : `New message from ${displaySender}`;
+  
+      // Send push
       if (sub.device_token) {
-        await sendPushNotification(sub.device_token, topicId, body, topicId);
+        await sendPushNotification(
+          sub.device_token,
+          topicId,                 // title
+          notificationBody,        // body
+          topicId,                 // topicId
+          {
+            payer: payer || '',
+            username: username || '',
+            message: cleanMessage,
+          }
+        );
       }
     }
   }

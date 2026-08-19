@@ -16,31 +16,28 @@ export const initFirebase = () => {
   }
 };
 
-export const sendPushNotification = async (deviceToken, title, body, topicId = '') => {
+export const sendPushNotification = async (deviceToken, title, body, topicId = '', extra = {}) => {
   if (!firebaseApp) return false;
 
   const message = {
     token: deviceToken,
-    notification: {
-      title,
-      body,
+    // No "notification" field → data-only
+    data: {
+      topicId: String(topicId),
+      title: String(title),
+      body: String(body),
+      ...Object.fromEntries(
+        Object.entries(extra).map(([k, v]) => [k, String(v ?? '')])
+      ),
     },
     android: {
       priority: 'high',
-      notification: {
-        channelId: 'hedera-messages',
-        sound: 'default',
-        priority: 'high',
-      },
-    },
-    data: {
-      topicId: String(topicId),
     },
   };
 
   try {
     const response = await admin.messaging().send(message);
-    console.log('✅ Push sent:', response);
+    console.log('✅ Data push sent:', response);
     return true;
   } catch (error) {
     console.error('Push failed:', error.message);

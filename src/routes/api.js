@@ -1,6 +1,7 @@
 import express from 'express';
 import { supabase } from '../utils/db.js';
 import { hederaListener } from '../services/hederaListener.js';
+import { usernameService } from '../services/usernameService.js'; // ← make sure the path is correct
 
 const router = express.Router();
 
@@ -210,7 +211,7 @@ router.get('/messages/:walletAddress', async (req, res) => {
 
   const { data, error } = await supabase
     .from('user_messages')
-    .select('id, topic_id, sender, body, created_at')
+    .select('id, topic_id, sender, body, created_at, payer') // ← add payer if the column exists
     .eq('wallet_address', walletAddress)
     .order('created_at', { ascending: false })
     .limit(100);
@@ -219,7 +220,27 @@ router.get('/messages/:walletAddress', async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 
-  res.json({ success: true, messages: data || [] });
+  // Enrich each message with resolved username
+  const messages = await Promise.all(
+    (data || []).map(async (msg) => {
+      // Prefer real payer account, fallback to sender
+      const payer = msg.payer || msg.sender;
+
+      // Try to resolve username from the username topic
+      const username = await usernameService.getUsername(payer);
+
+      return {
+        id: msg.id,
+        topic_id: msg.topic_id,
+        payer: payer,                    // real account ID (0.0.xxx)
+        username: username || null,      // resolved username (or null)
+        body: msg.body,
+        created_at: msg.created_at,
+      };
+    })
+  );
+
+  res.json({ success: true, messages });
 });
 
 export default router;
