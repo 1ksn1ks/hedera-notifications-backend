@@ -1,8 +1,17 @@
-import { supabase } from '../utils/db.js';
+import {
+  deleteMessagesOlderThan,
+  listActiveTopicIds,
+  getTopicState,
+  upsertTopicState,
+  listTopicSubscribers,
+  insertUserMessage,
+} from '../utils/db.js';
 import { sendPushNotification } from './notificationService.js';
 import { usernameService } from './usernameService.js';
+import { previewMeritocracy, clipText } from './meritocracyFormat.js';
 
-const isMainnet = process.env.MIRROR_NODE_URL?.includes('mainnet');
+const mirrorHost = process.env.MIRROR_NODE_URL || 'mainnet.mirrornode.hedera.com:443';
+const isMainnet = mirrorHost.includes('mainnet');
 const MIRROR_URL = isMainnet
   ? 'https://mainnet-public.mirrornode.hedera.com'
   : 'https://testnet.mirrornode.hedera.com';
@@ -46,30 +55,13 @@ class TopicPoller {
     this.lastCleanup = now;
   
     const cutoff = new Date(now - MESSAGE_RETENTION_MS).toISOString();
-    const { error } = await supabase
-      .from('user_messages')
-      .delete()
-      .lt('created_at', cutoff);
-  
-    if (error) {
-      console.log('🧹 Cleanup error:', error.message);
-    } else {
-      console.log('🧹 Old user_messages cleaned (older than 7 days)');
-    }
+    const removed = deleteMessagesOlderThan(cutoff);
+    console.log(`🧹 Old user_messages cleaned (older than 7 days): ${removed}`);
   }
 
   async refreshActiveTopics() {
     if (this.activeTopics.length === 0 || this.currentIndex === 0) {
-      const { data: topics, error } = await supabase
-        .from('topic_subscriptions')
-        .select('topic_id');
-
-      if (error || !topics) {
-        this.activeTopics = [];
-        return;
-      }
-
-      this.activeTopics = [...new Set(topics.map((t) => t.topic_id))];
+      this.activeTopics = listActiveTopicIds();
       console.log(`📋 Tracking ${this.activeTopics.length} active topics`);
     }
   }
@@ -92,11 +84,7 @@ class TopicPoller {
 
   async pollTopic(topicId) {
     try {
-      const { data: state } = await supabase
-        .from('topic_state')
-        .select('last_sequence_number')
-        .eq('topic_id', topicId)
-        .single();
+      const state = getTopicState(topicId);
 
       const lastSeq = state?.last_sequence_number || 0;
 
@@ -125,11 +113,7 @@ class TopicPoller {
 
       if (lastSeq === 0) {
         const newestSeq = messages[0].sequence_number;
-        await supabase.from('topic_state').upsert({
-          topic_id: topicId,
-          last_sequence_number: newestSeq,
-          updated_at: new Date().toISOString(),
-        });
+        upsertTopicState(topicId, newestSeq);
         console.log(`   Initialized topic ${topicId} at sequence ${newestSeq}`);
         return;
       }
@@ -139,11 +123,7 @@ class TopicPoller {
       }
 
       const newestSeq = messages[messages.length - 1].sequence_number;
-      await supabase.from('topic_state').upsert({
-        topic_id: topicId,
-        last_sequence_number: newestSeq,
-        updated_at: new Date().toISOString(),
-      });
+      upsertTopicState(topicId, newestSeq);
     } catch (err) {
       console.error(`Error polling ${topicId}:`, err.message);
     }
@@ -169,19 +149,12 @@ class TopicPoller {
     }
   
     console.log(`📨 New message on ${topicId} from ${displaySender}: ${msgContent.substring(0, 80)}...`);
+
+    // Store the consensus message unchanged. The banner uses a short
+    // human line only when the payload is a Meritocracy post.
+    const preview = clipText(previewMeritocracy(msgContent));
   
-    let cleanMessage = msgContent;
-    try {
-      const parsed = JSON.parse(msgContent);
-      if (parsed.userMessage) cleanMessage = parsed.userMessage;
-    } catch (e) {}
-  
-    const { data: subscribers } = await supabase
-      .from('topic_subscriptions')
-      .select(
-        'device_token, wallet_address, show_full_message, allowed_senders, blocked_senders, filter_mode'
-      )
-      .eq('topic_id', topicId);
+    const subscribers = listTopicSubscribers(topicId);
   
     if (!subscribers || subscribers.length === 0) return;
   
@@ -215,30 +188,26 @@ class TopicPoller {
   
       // Save to personal feed
       if (sub.wallet_address) {
-        const { error: insertError } = await supabase.from('user_messages').insert({
-          wallet_address: sub.wallet_address,
-          topic_id: topicId,
-          payer: payer,
-          sender: username,
-          body: cleanMessage,
-          sequence_number: msg.sequence_number ?? null,
-        });
-  
-        if (insertError) {
+        try {
+          insertUserMessage({
+            walletAddress: sub.wallet_address,
+            topicId,
+            payer,
+            sender: username,
+            body: msgContent,
+            sequenceNumber: msg.sequence_number ?? null,
+          });
+        } catch (insertError) {
           console.log('user_messages insert error:', insertError.message);
         }
       }
   
       // Build notification body
       const notificationBody = sub.show_full_message
-        ? `${displaySender}: ${
-            cleanMessage.length > 100
-              ? cleanMessage.substring(0, 97) + '...'
-              : cleanMessage
-          }`
+        ? `${displaySender}: ${preview}`
         : `New message from ${displaySender}`;
   
-      // Send push
+      // Send push. data.message stays the raw consensus message.
       if (sub.device_token) {
         await sendPushNotification(
           sub.device_token,
@@ -248,7 +217,7 @@ class TopicPoller {
           {
             payer: payer || '',
             username: username || '',
-            message: cleanMessage,
+            message: msgContent,
           }
         );
       }

@@ -1,4 +1,5 @@
-const isMainnet = process.env.MIRROR_NODE_URL?.includes('mainnet');
+const mirrorHost = process.env.MIRROR_NODE_URL || 'mainnet.mirrornode.hedera.com:443';
+const isMainnet = mirrorHost.includes('mainnet');
 const MIRROR_URL = isMainnet
   ? 'https://mainnet-public.mirrornode.hedera.com'
   : 'https://testnet.mirrornode.hedera.com';

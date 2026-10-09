@@ -1,7 +1,20 @@
 import express from 'express';
-import { supabase } from '../utils/db.js';
+import {
+  upsertUser,
+  updateTopicDeviceTokens,
+  upsertTopicSubscription,
+  deleteTopicSubscription,
+  clearMessages,
+  deleteMessages,
+  updateTopicFilter,
+  listSubscriptions,
+  updateShowFullMessage,
+  listAllSubscriptions,
+  listMessages,
+} from '../utils/db.js';
 import { hederaListener } from '../services/hederaListener.js';
 import { usernameService } from '../services/usernameService.js'; // ← make sure the path is correct
+import { listDomains, resolveTopicInput } from '../services/domains.js';
 
 const router = express.Router();
 
@@ -12,31 +25,12 @@ router.post('/register', async (req, res) => {
     return res.status(400).json({ error: 'Missing deviceToken or walletAddress' });
   }
 
-  // 1. Upsert user
-  const { error: userError } = await supabase
-    .from('user_subscriptions')
-    .upsert(
-      {
-        device_token: deviceToken,
-        platform: platform || 'android',
-        wallet_address: walletAddress,
-      },
-      { onConflict: 'wallet_address' }
-    );
-
-  if (userError) {
-    console.error(userError);
-    return res.status(500).json({ error: userError.message });
-  }
-
-  // 2. Update device token on all existing topic subscriptions for this wallet
-  const { error: topicError } = await supabase
-    .from('topic_subscriptions')
-    .update({ device_token: deviceToken })
-    .eq('wallet_address', walletAddress);
-
-  if (topicError) {
-    console.error(topicError);
+  try {
+    upsertUser({ walletAddress, deviceToken, platform: platform || 'android' });
+    updateTopicDeviceTokens(walletAddress, deviceToken);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: error.message });
   }
 
   res.json({ success: true });
@@ -51,14 +45,20 @@ router.post('/subscribe', async (req, res) => {
     });
   }
 
-  let cleaned = topicId.trim();
-
-  // Convert "12345" → "0.0.12345"
-  if (/^\d+$/.test(cleaned)) {
-    cleaned = `0.0.${cleaned}`;
+  let resolved;
+  try {
+    resolved = await resolveTopicInput(topicId);
+  } catch (error) {
+    console.error(error);
+    return res.status(502).json({ error: 'Domain registry unavailable' });
   }
 
-  // Basic format check
+  if (!resolved) {
+    return res.status(404).json({ error: 'Domain not found' });
+  }
+
+  const cleaned = resolved.topicId;
+
   if (!/^\d+\.\d+\.\d+$/.test(cleaned)) {
     return res.status(400).json({ error: 'Invalid topic format' });
   }
@@ -69,24 +69,28 @@ router.post('/subscribe', async (req, res) => {
     return res.status(404).json({ error: 'Topic does not exist' });
   }
 
-  // Save to database (keyed by wallet)
-  const { error } = await supabase
-    .from('topic_subscriptions')
-    .upsert(
-      {
-        device_token: deviceToken,
-        wallet_address: walletAddress,
-        topic_id: cleaned,
-      },
-      { onConflict: 'wallet_address,topic_id' }
-    );
-
-  if (error) {
+  try {
+    upsertTopicSubscription({
+      deviceToken,
+      walletAddress,
+      topicId: cleaned,
+    });
+  } catch (error) {
     console.error(error);
     return res.status(500).json({ error: error.message });
   }
 
-  res.json({ success: true, topicId: cleaned });
+  res.json({ success: true, topicId: cleaned, domain: resolved.domain || null });
+});
+
+router.get('/domains', async (req, res) => {
+  try {
+    const domains = await listDomains();
+    res.json({ domains });
+  } catch (error) {
+    console.error(error);
+    res.status(502).json({ error: 'Domain registry unavailable' });
+  }
 });
 
 router.post('/unsubscribe', async (req, res) => {
@@ -96,13 +100,9 @@ router.post('/unsubscribe', async (req, res) => {
     return res.status(400).json({ error: 'Missing walletAddress or topicId' });
   }
 
-  const { error } = await supabase
-    .from('topic_subscriptions')
-    .delete()
-    .eq('wallet_address', walletAddress)
-    .eq('topic_id', topicId);
-
-  if (error) {
+  try {
+    deleteTopicSubscription(walletAddress, topicId);
+  } catch (error) {
     console.error('Unsubscribe error:', error);
     return res.status(500).json({ error: error.message });
   }
@@ -117,12 +117,36 @@ router.post('/messages/clear', async (req, res) => {
     return res.status(400).json({ error: 'Missing walletAddress' });
   }
 
-  const { error } = await supabase
-    .from('user_messages')
-    .delete()
-    .eq('wallet_address', walletAddress);
+  try {
+    clearMessages(walletAddress);
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
 
-  if (error) {
+  res.json({ success: true });
+});
+
+router.post('/messages/delete', async (req, res) => {
+  const { walletAddress, ids, topicIds, payers } = req.body;
+
+  if (!walletAddress) {
+    return res.status(400).json({ error: 'Missing walletAddress' });
+  }
+
+  if (Array.isArray(payers) && payers.some(payer => /[,()]/.test(String(payer)))) {
+    return res.status(400).json({ error: 'Invalid payer' });
+  }
+  if (
+    !(Array.isArray(ids) && ids.length > 0)
+    && !(Array.isArray(topicIds) && topicIds.length > 0)
+    && !(Array.isArray(payers) && payers.length > 0)
+  ) {
+    return res.status(400).json({ error: 'Missing ids, topicIds or payers' });
+  }
+
+  try {
+    deleteMessages({ walletAddress, ids, topicIds, payers });
+  } catch (error) {
     return res.status(500).json({ error: error.message });
   }
 
@@ -136,18 +160,15 @@ router.post('/update-filter', async (req, res) => {
     return res.status(400).json({ error: 'Missing data' });
   }
 
-  const updates = {};
-  if (filterMode !== undefined) updates.filter_mode = filterMode;
-  if (allowedSenders !== undefined) updates.allowed_senders = allowedSenders;
-  if (blockedSenders !== undefined) updates.blocked_senders = blockedSenders;
-
-  const { error } = await supabase
-    .from('topic_subscriptions')
-    .update(updates)
-    .eq('wallet_address', walletAddress)
-    .eq('topic_id', topicId);
-
-  if (error) {
+  try {
+    updateTopicFilter({
+      walletAddress,
+      topicId,
+      filterMode,
+      allowedSenders,
+      blockedSenders,
+    });
+  } catch (error) {
     return res.status(500).json({ error: error.message });
   }
 
@@ -160,21 +181,19 @@ router.get('/subscriptions/:walletAddress', async (req, res) => {
   console.log('PARAMS:', req.params);
   console.log('Looking up wallet:', walletAddress);
 
-  const { data, error } = await supabase
-    .from('topic_subscriptions')
-    .select('topic_id, show_full_message, filter_mode, allowed_senders, blocked_senders, wallet_address')
-    .eq('wallet_address', walletAddress);
-
-  console.log('Result:', data);
-  console.log('Error:', error);
-
-  if (error) {
+  let data;
+  try {
+    data = listSubscriptions(walletAddress);
+  } catch (error) {
+    console.log('Error:', error);
     return res.status(500).json({ error: error.message });
   }
 
+  console.log('Result:', data);
+
   res.json({
     success: true,
-    subscriptions: data || [],
+    subscriptions: data,
   });
 });
 
@@ -185,13 +204,9 @@ router.post('/update-preference', async (req, res) => {
     return res.status(400).json({ error: 'Missing data' });
   }
 
-  const { error } = await supabase
-    .from('topic_subscriptions')
-    .update({ show_full_message: showFullMessage })
-    .eq('wallet_address', walletAddress)
-    .eq('topic_id', topicId);
-
-  if (error) {
+  try {
+    updateShowFullMessage({ walletAddress, topicId, showFullMessage });
+  } catch (error) {
     return res.status(500).json({ error: error.message });
   }
 
@@ -199,24 +214,20 @@ router.post('/update-preference', async (req, res) => {
 });
 
 router.get('/debug/topics', async (req, res) => {
-  const { data, error } = await supabase
-    .from('topic_subscriptions')
-    .select('*');
-
-  res.json({ data, error });
+  try {
+    res.json({ data: listAllSubscriptions(), error: null });
+  } catch (error) {
+    res.json({ data: null, error: error.message });
+  }
 });
 
 router.get('/messages/:walletAddress', async (req, res) => {
   const { walletAddress } = req.params;
 
-  const { data, error } = await supabase
-    .from('user_messages')
-    .select('id, topic_id, sender, body, created_at, payer') // ← add payer if the column exists
-    .eq('wallet_address', walletAddress)
-    .order('created_at', { ascending: false })
-    .limit(100);
-
-  if (error) {
+  let data;
+  try {
+    data = listMessages(walletAddress, 100);
+  } catch (error) {
     return res.status(500).json({ error: error.message });
   }
 

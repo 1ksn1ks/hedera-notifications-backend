@@ -1,6 +1,6 @@
 import express from 'express';
 import { config } from './config.js';
-import { supabase } from './utils/db.js';
+import { db } from './utils/db.js';
 import apiRoutes from './routes/api.js';
 import { initFirebase } from './services/notificationService.js';
 import { topicPoller } from './services/topicPoller.js';
@@ -14,14 +14,10 @@ app.get('/', (req, res) => {
   res.send('Hedera Topic Notifier Backend is running!');
 });
 
-app.get('/test-db', async (req, res) => {
+app.get('/test-db', (req, res) => {
   try {
-    const { data, error } = await supabase.from('test').select('*').limit(1);
-    if (error && error.code === '42P01') {
-      res.json({ status: 'connected', message: 'Supabase connected successfully!' });
-    } else {
-      res.json({ status: 'connected' });
-    }
+    const row = db.prepare('SELECT COUNT(*) AS n FROM user_subscriptions').get();
+    res.json({ status: 'connected', users: row.n });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

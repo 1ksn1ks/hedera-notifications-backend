@@ -1,11 +1,12 @@
 import { Client, TopicMessageQuery, TopicId } from '@hashgraph/sdk';
-import { supabase } from '../utils/db.js';
+import { listTopicSubscribers } from '../utils/db.js';
 import { sendPushNotification } from './notificationService.js';
+import { previewMeritocracy, clipText } from './meritocracyFormat.js';
 
 class HederaListener {
   constructor() {
     this.client = Client.forNetwork({}).setMirrorNetwork(
-      process.env.MIRROR_NODE_URL || 'testnet.mirrornode.hedera.com:443'
+      process.env.MIRROR_NODE_URL || 'mainnet.mirrornode.hedera.com:443'
     );
     this.subscriptions = new Map();
   }
@@ -13,7 +14,7 @@ class HederaListener {
   // Check if a topic actually exists on the Mirror Node
   async topicExists(topicId) {
     try {
-      const isMainnet = process.env.MIRROR_NODE_URL?.includes('mainnet');
+      const isMainnet = (process.env.MIRROR_NODE_URL || 'mainnet.mirrornode.hedera.com:443').includes('mainnet');
       const mirrorUrl = isMainnet
         ? 'https://mainnet-public.mirrornode.hedera.com'
         : 'https://testnet.mirrornode.hedera.com';
@@ -74,31 +75,14 @@ class HederaListener {
             );
 
             // Get all subscribers for this topic
-            const { data: subscribers, error } = await supabase
-              .from('topic_subscriptions')
-              .select('device_token, show_full_message, allowed_senders')
-              .eq('topic_id', cleaned);
-
-            if (error) {
-              console.error(error);
-              return;
-            }
+            const subscribers = listTopicSubscribers(cleaned);
 
             if (!subscribers || subscribers.length === 0) {
               console.log('No subscribers');
               return;
             }
 
-            // Extract clean message text
-            let cleanMessage = msgContent;
-            try {
-              const parsed = JSON.parse(msgContent);
-              if (parsed.userMessage) {
-                cleanMessage = parsed.userMessage;
-              }
-            } catch (e) {
-              // not JSON, keep original
-            }
+            const preview = clipText(previewMeritocracy(msgContent));
 
             for (const sub of subscribers) {
               // Filter by allowed senders if set
@@ -112,18 +96,18 @@ class HederaListener {
               }
 
               const body = sub.show_full_message
-                ? `${sender}: ${
-                    cleanMessage.length > 100
-                      ? cleanMessage.substring(0, 97) + '...'
-                      : cleanMessage
-                  }`
+                ? `${sender}: ${preview}`
                 : `New message from ${sender}`;
 
               const result = await sendPushNotification(
                 sub.device_token,
                 cleaned, // title = topicId
                 body,
-                cleaned  // data.topicId
+                cleaned, // data.topicId
+                {
+                  payer: sender,
+                  message: msgContent,
+                }
               );
               console.log('Push result:', result);
             }
