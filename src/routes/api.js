@@ -237,14 +237,14 @@ router.get('/messages/:walletAddress', async (req, res) => {
       // Prefer real payer account, fallback to sender
       const payer = msg.payer || msg.sender;
 
-      // Try to resolve username from the username topic
-      const username = await usernameService.getUsername(payer);
+      const profile = await usernameService.getProfile(payer);
 
       return {
         id: msg.id,
         topic_id: msg.topic_id,
-        payer: payer,                    // real account ID (0.0.xxx)
-        username: username || null,      // resolved username (or null)
+        payer: payer,
+        username: profile.username,
+        profile_pic: profile.profilePic,
         body: msg.body,
         created_at: msg.created_at,
       };

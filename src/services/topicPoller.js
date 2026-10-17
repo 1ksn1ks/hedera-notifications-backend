@@ -133,8 +133,10 @@ class TopicPoller {
     const msgContent = Buffer.from(msg.message, 'base64').toString('utf8');
     const payer = msg.payer_account_id || null;
   
-    // Resolve username
-    const username = payer ? await usernameService.getUsername(payer) : null;
+    const profile = payer
+      ? await usernameService.getProfile(payer)
+      : { username: null, profilePic: null };
+    const username = profile.username;
   
     // Nice display name for logs and notifications
     let displaySender;
@@ -217,6 +219,7 @@ class TopicPoller {
           {
             payer: payer || '',
             username: username || '',
+            profilePic: profile.profilePic || '',
             message: msgContent,
           }
         );
