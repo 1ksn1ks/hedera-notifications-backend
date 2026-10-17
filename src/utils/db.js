@@ -60,6 +60,13 @@ db.exec(`
     last_sequence_number INTEGER NOT NULL,
     updated_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS profiles (
+    account_id TEXT PRIMARY KEY,
+    username TEXT NOT NULL DEFAULT '',
+    profile_pic TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+  );
 `);
 
 console.log(`SQLite ready at ${dbPath}`);
