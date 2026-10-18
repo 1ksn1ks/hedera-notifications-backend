@@ -126,6 +126,66 @@ test('a cut-off topic and a rolled-back write keep the previous rows', async () 
   assert.equal(readStoredProfiles(database).names['0.0.2'], 'kept');
 });
 
+test('a failed topic aborts the other profile fetch', async () => {
+  const database = openDb();
+  let siblingAborted = false;
+  const fetchImpl = (url, init) => {
+    if (String(url).includes(PIC_TOPIC)) {
+      return Promise.resolve({ ok: false, status: 500, json: async () => ({}) });
+    }
+    return new Promise((_resolve, reject) => {
+      const fail = () => {
+        siblingAborted = true;
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      };
+      if (init.signal.aborted) {
+        fail();
+        return;
+      }
+      init.signal.addEventListener('abort', fail);
+    });
+  };
+  const result = await Promise.race([
+    loadAndStoreProfiles(database, {
+      mirrorUrl: 'https://mirror.test',
+      fetchImpl,
+      timeoutMs: 5000,
+      warn: () => {},
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('hung')), 500)),
+  ]);
+  assert.equal(result.ok, false);
+  assert.equal(siblingAborted, true);
+  assert.equal(readStoredProfiles(database).names['0.0.2'], 'kept');
+});
+
+test('a failed load waits a minute before trying again', async () => {
+  const database = openDb();
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return { ok: false, status: 503, json: async () => ({}) };
+  };
+  let now = 1_000_000;
+  const service = new UsernameService({
+    database,
+    fetchImpl,
+    mirrorUrl: 'https://mirror.test',
+    clock: () => now,
+  });
+  await service.loadProfiles();
+  const afterFail = calls;
+  assert.ok(afterFail >= 1);
+  await service.loadProfiles();
+  assert.equal(calls, afterFail);
+  now += 59_000;
+  await service.loadProfiles();
+  assert.equal(calls, afterFail);
+  now += 2_000;
+  await service.loadProfiles();
+  assert.equal(calls, afterFail * 2);
+});
+
 test('an empty topic keeps old names and does not refetch immediately', async () => {
   const database = openDb();
   let calls = 0;

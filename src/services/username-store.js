@@ -116,8 +116,13 @@ export function profilesFromRows(nameRows, picRows) {
   return { names, pictures };
 }
 
-async function fetchJson(url, fetchImpl, timeoutMs) {
+async function fetchJson(url, fetchImpl, timeoutMs, signal) {
   const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', onAbort);
+  }
   let timer;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => {
@@ -130,22 +135,25 @@ async function fetchJson(url, fetchImpl, timeoutMs) {
       fetchImpl(url, { signal: controller.signal }),
       timeout,
     ]);
+    if (signal && signal.aborted) throw new Error('Profile request aborted');
     if (!res.ok) {
       throw new Error(`Profile request failed: ${res.status}`);
     }
     return await Promise.race([res.json(), timeout]);
   } finally {
     clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
   }
 }
 
-export async function readTopicPages(topicId, { mirrorUrl, fetchImpl, timeoutMs, pageCap = PAGE_CAP }) {
+export async function readTopicPages(topicId, { mirrorUrl, fetchImpl, timeoutMs, pageCap = PAGE_CAP, signal }) {
   let path = `/api/v1/topics/${topicId}/messages?limit=100&order=desc`;
   const rows = [];
   for (let page = 0; page < pageCap; page += 1) {
+    if (signal && signal.aborted) throw new Error('Profile request aborted');
     if (!path) return rows;
     const url = path.startsWith('http') ? path : mirrorUrl + path;
-    const json = await fetchJson(url, fetchImpl, timeoutMs);
+    const json = await fetchJson(url, fetchImpl, timeoutMs, signal);
     rows.push(...(json.messages || []));
     path = json.links?.next || '';
   }
@@ -166,10 +174,15 @@ export async function loadAndStoreProfiles(database, {
   warn = (message) => console.warn(message),
 } = {}) {
   let loaded;
+  const shared = new AbortController();
+  const stopBoth = (err) => {
+    shared.abort();
+    throw err;
+  };
   try {
     const [nameRows, picRows] = await Promise.all([
-      readTopicPages(USERNAME_TOPIC, { mirrorUrl, fetchImpl, timeoutMs, pageCap }),
-      readTopicPages(PICTURE_TOPIC, { mirrorUrl, fetchImpl, timeoutMs, pageCap }),
+      readTopicPages(USERNAME_TOPIC, { mirrorUrl, fetchImpl, timeoutMs, pageCap, signal: shared.signal }).catch(stopBoth),
+      readTopicPages(PICTURE_TOPIC, { mirrorUrl, fetchImpl, timeoutMs, pageCap, signal: shared.signal }).catch(stopBoth),
     ]);
     loaded = profilesFromRows(nameRows, picRows);
   } catch (err) {
@@ -201,16 +214,19 @@ export async function loadAndStoreProfiles(database, {
 }
 
 export class UsernameService {
-  constructor({ database, fetchImpl, timeoutMs = FETCH_TIMEOUT_MS, mirrorUrl, now = () => new Date().toISOString() }) {
+  constructor({ database, fetchImpl, timeoutMs = FETCH_TIMEOUT_MS, mirrorUrl, now = () => new Date().toISOString(), clock = () => Date.now() }) {
     this.database = database;
     this.fetchImpl = fetchImpl;
     this.timeoutMs = timeoutMs;
     this.mirrorUrl = mirrorUrl;
     this.now = now;
+    this.clock = clock;
     this.accountUsernames = {};
     this.accountPictures = {};
     this.lastLoaded = 0;
+    this.retryAfter = 0;
     this.CACHE_TTL = 5 * 60 * 1000;
+    this.RETRY_BACKOFF_MS = 60 * 1000;
     this.loading = null;
     try {
       const stored = readStoredProfiles(database);
@@ -223,7 +239,7 @@ export class UsernameService {
 
   cacheFresh() {
     return (
-      Date.now() - this.lastLoaded < this.CACHE_TTL &&
+      this.clock() - this.lastLoaded < this.CACHE_TTL &&
       (Object.keys(this.accountUsernames).length > 0 ||
         Object.keys(this.accountPictures).length > 0)
     );
@@ -231,6 +247,7 @@ export class UsernameService {
 
   async loadProfiles() {
     if (this.cacheFresh()) return;
+    if (this.clock() < this.retryAfter) return;
     if (!this.loading) {
       this.loading = this.fetchProfiles().finally(() => {
         this.loading = null;
@@ -247,12 +264,14 @@ export class UsernameService {
       nowIso: this.now(),
     });
     if (!result.ok) {
-      if (result.kept) this.lastLoaded = Date.now();
+      if (result.kept) this.lastLoaded = this.clock();
+      else this.retryAfter = this.clock() + this.RETRY_BACKOFF_MS;
       return;
     }
+    this.retryAfter = 0;
     this.accountUsernames = result.names;
     this.accountPictures = result.pictures;
-    this.lastLoaded = Date.now();
+    this.lastLoaded = this.clock();
     console.log(
       `Loaded ${Object.keys(result.names).length} usernames and ${Object.keys(result.pictures).length} profile pictures`
     );
