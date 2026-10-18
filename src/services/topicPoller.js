@@ -9,6 +9,12 @@ import {
 import { sendPushNotification } from './notificationService.js';
 import { usernameService } from './usernameService.js';
 import { previewMeritocracy, clipText } from './meritocracyFormat.js';
+import {
+  acceptTopicMessage,
+  createChunkBuffer,
+  pushMessageText,
+  sweepChunkBuffer,
+} from './topic-chunks.js';
 
 const mirrorHost = process.env.MIRROR_NODE_URL || 'mainnet.mirrornode.hedera.com:443';
 const isMainnet = mirrorHost.includes('mainnet');
@@ -27,6 +33,7 @@ class TopicPoller {
     this.currentIndex = 0;
     this.activeTopics = [];
     this.lastCleanup = 0;
+    this.chunks = createChunkBuffer();
   }
 
   start() {
@@ -39,6 +46,7 @@ class TopicPoller {
   async loop() {
     while (this.isRunning) {
       try {
+        sweepChunkBuffer(this.chunks);
         await this.maybeCleanup();
         await this.refreshActiveTopics();
         await this.pollNextBatch();
@@ -118,8 +126,12 @@ class TopicPoller {
         return;
       }
 
+      // The sequence watermark still moves to the end of the page. An
+      // unfinished chunk stays in memory so a later page can finish it.
       for (const msg of messages) {
-        await this.processMessage(topicId, msg);
+        const assembled = acceptTopicMessage(this.chunks, topicId, msg);
+        if (!assembled) continue;
+        await this.processMessage(topicId, assembled);
       }
 
       const newestSeq = messages[messages.length - 1].sequence_number;
@@ -129,9 +141,9 @@ class TopicPoller {
     }
   }
 
-  async processMessage(topicId, msg) {
-    const msgContent = Buffer.from(msg.message, 'base64').toString('utf8');
-    const payer = msg.payer_account_id || null;
+  async processMessage(topicId, assembled) {
+    const msgContent = assembled.body;
+    const payer = assembled.payer || null;
   
     const profile = payer
       ? await usernameService.getProfile(payer)
@@ -197,7 +209,7 @@ class TopicPoller {
             payer,
             sender: username,
             body: msgContent,
-            sequenceNumber: msg.sequence_number ?? null,
+            sequenceNumber: assembled.sequenceNumber ?? null,
           });
         } catch (insertError) {
           console.log('user_messages insert error:', insertError.message);
@@ -209,7 +221,8 @@ class TopicPoller {
         ? `${displaySender}: ${preview}`
         : `New message from ${displaySender}`;
   
-      // Send push. data.message stays the raw consensus message.
+      // Stored body is the full consensus text. A chunked push carries
+      // only the clipped preview so a long message stays a small payload.
       if (sub.device_token) {
         await sendPushNotification(
           sub.device_token,
@@ -220,7 +233,7 @@ class TopicPoller {
             payer: payer || '',
             username: username || '',
             profilePic: profile.profilePic || '',
-            message: msgContent,
+            message: pushMessageText(msgContent, assembled.chunked),
           }
         );
       }

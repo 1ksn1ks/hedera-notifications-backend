@@ -1,7 +1,71 @@
-import { Client, TopicMessageQuery, TopicId } from '@hashgraph/sdk';
+import { AccountId, Client, Timestamp, TopicId, TopicMessageQuery } from '@hashgraph/sdk';
+import * as HieroProto from '@hiero-ledger/proto';
 import { listTopicSubscribers } from '../utils/db.js';
 import { sendPushNotification } from './notificationService.js';
 import { previewMeritocracy, clipText } from './meritocracyFormat.js';
+import {
+  acceptTopicMessage,
+  createChunkBuffer,
+  pushMessageText,
+} from './topic-chunks.js';
+
+function asCount(value) {
+  if (value == null || value === '') return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value.toNumber === 'function') {
+    const count = value.toNumber();
+    return Number.isFinite(count) ? count : null;
+  }
+  const count = Number(value);
+  return Number.isFinite(count) ? count : null;
+}
+
+function mirrorTimestamp(timestamp) {
+  if (timestamp == null) return null;
+  const seconds = timestamp.seconds == null ? '0' : String(timestamp.seconds);
+  const nanos = asCount(timestamp.nanos) ?? 0;
+  return `${seconds}.${String(Math.trunc(nanos)).padStart(9, '0')}`;
+}
+
+function accountString(accountID) {
+  if (accountID == null) return '';
+  try {
+    return AccountId._fromProtobuf(accountID).toString();
+  } catch {
+    return '';
+  }
+}
+
+// gRPC chunks use the same chunk_info shape as the mirror REST rows.
+function rowFromStream(response) {
+  const chunk = response.chunkInfo;
+  let chunkInfo = null;
+  let payer = null;
+  if (chunk != null) {
+    const tx = chunk.initialTransactionID;
+    const account = tx?.accountID ? accountString(tx.accountID) : '';
+    chunkInfo = {
+      initial_transaction_id: {
+        account_id: account,
+        nonce: tx?.nonce == null ? 0 : asCount(tx.nonce) ?? 0,
+        scheduled: Boolean(tx?.scheduled),
+        transaction_valid_start: tx?.transactionValidStart
+          ? mirrorTimestamp(tx.transactionValidStart)
+          : '',
+      },
+      number: asCount(chunk.number),
+      total: asCount(chunk.total),
+    };
+    payer = account || null;
+  }
+  return {
+    message: response.message == null ? Buffer.alloc(0) : Buffer.from(response.message),
+    consensus_timestamp: mirrorTimestamp(response.consensusTimestamp),
+    payer_account_id: payer,
+    sequence_number: asCount(response.sequenceNumber),
+    chunk_info: chunkInfo,
+  };
+}
 
 class HederaListener {
   constructor() {
@@ -9,6 +73,7 @@ class HederaListener {
       process.env.MIRROR_NODE_URL || 'mainnet.mirrornode.hedera.com:443'
     );
     this.subscriptions = new Map();
+    this.chunks = createChunkBuffer();
   }
 
   // Check if a topic actually exists on the Mirror Node
@@ -24,6 +89,81 @@ class HederaListener {
     } catch (err) {
       console.error('Mirror node check failed:', err.message);
       return false;
+    }
+  }
+
+  ingestStream(query, topicId, data) {
+    let response;
+    try {
+      response = HieroProto.com.hedera.mirror.api.proto.ConsensusTopicResponse.decode(data);
+    } catch (err) {
+      console.error(`❌ Error on topic ${topicId}:`, err.message || err);
+      return;
+    }
+
+    if (query._limit?.gt(0)) {
+      query._limit = query._limit.sub(1);
+    }
+    if (response.consensusTimestamp != null) {
+      query._startTime = Timestamp._fromProtobuf(response.consensusTimestamp).plusNanos(1);
+    }
+
+    let assembled;
+    try {
+      assembled = acceptTopicMessage(this.chunks, topicId, rowFromStream(response));
+    } catch (err) {
+      console.error(`❌ Error on topic ${topicId}:`, err.message || err);
+      return;
+    }
+    if (!assembled) return;
+
+    void this.deliver(topicId, assembled).catch((err) => {
+      console.error(`❌ Error on topic ${topicId}:`, err.message || err);
+    });
+  }
+
+  async deliver(topicId, assembled) {
+    const msgContent = assembled.body;
+    const sender = assembled.payer || 'Unknown';
+
+    console.log(
+      `📨 New message on ${topicId} from ${sender}: ${msgContent.substring(0, 80)}...`
+    );
+
+    const subscribers = listTopicSubscribers(topicId);
+
+    if (!subscribers || subscribers.length === 0) {
+      console.log('No subscribers');
+      return;
+    }
+
+    const preview = clipText(previewMeritocracy(msgContent));
+
+    for (const sub of subscribers) {
+      if (sub.allowed_senders && sub.allowed_senders.length > 0) {
+        if (!sub.allowed_senders.includes(sender)) {
+          console.log(
+            `Skipping ${sub.device_token} - sender ${sender} not allowed`
+          );
+          continue;
+        }
+      }
+
+      const body = sub.show_full_message
+        ? `${sender}: ${preview}`
+        : `New message from ${sender}`;
+
+      const result = await sendPushNotification(
+        sub.device_token,
+        topicId,
+        body,
+        topicId,
+        {
+          payer: sender,
+          message: pushMessageText(msgContent, assembled.chunked),
+        }
+      );
+      console.log('Push result:', result);
     }
   }
 
@@ -55,66 +195,22 @@ class HederaListener {
     console.log(`🎧 Listening to topic: ${cleaned}`);
 
     try {
-      const query = new TopicMessageQuery()
-        .setTopicId(TopicId.fromString(cleaned))
-        .subscribe(
-          this.client,
-          // Error handler
-          (error) => {
-            console.error(`❌ Error on topic ${cleaned}:`, error.message || error);
-            this.subscriptions.delete(cleaned);
-          },
-          // Message handler
-          async (message) => {
-            const msgContent = Buffer.from(message.contents).toString();
-            let sender =
-              message.initialTransactionId?.accountId?.toString() || 'Unknown';
+      const query = new TopicMessageQuery().setTopicId(TopicId.fromString(cleaned));
+      // Read chunk_info off each gRPC frame. The SDK would otherwise join
+      // chunks itself and keep the last chunk's timestamp.
+      query._handleMessage = (data) => {
+        this.ingestStream(query, cleaned, data);
+      };
+      const subscription = query.subscribe(
+        this.client,
+        (error) => {
+          console.error(`❌ Error on topic ${cleaned}:`, error.message || error);
+          this.subscriptions.delete(cleaned);
+        },
+        () => {}
+      );
 
-            console.log(
-              `📨 New message on ${cleaned} from ${sender}: ${msgContent.substring(0, 80)}...`
-            );
-
-            // Get all subscribers for this topic
-            const subscribers = listTopicSubscribers(cleaned);
-
-            if (!subscribers || subscribers.length === 0) {
-              console.log('No subscribers');
-              return;
-            }
-
-            const preview = clipText(previewMeritocracy(msgContent));
-
-            for (const sub of subscribers) {
-              // Filter by allowed senders if set
-              if (sub.allowed_senders && sub.allowed_senders.length > 0) {
-                if (!sub.allowed_senders.includes(sender)) {
-                  console.log(
-                    `Skipping ${sub.device_token} - sender ${sender} not allowed`
-                  );
-                  continue;
-                }
-              }
-
-              const body = sub.show_full_message
-                ? `${sender}: ${preview}`
-                : `New message from ${sender}`;
-
-              const result = await sendPushNotification(
-                sub.device_token,
-                cleaned, // title = topicId
-                body,
-                cleaned, // data.topicId
-                {
-                  payer: sender,
-                  message: msgContent,
-                }
-              );
-              console.log('Push result:', result);
-            }
-          }
-        );
-
-      this.subscriptions.set(cleaned, query);
+      this.subscriptions.set(cleaned, subscription);
     } catch (err) {
       console.error(`❌ Failed to start listener for ${cleaned}:`, err.message);
     }
