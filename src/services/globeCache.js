@@ -94,6 +94,7 @@ export function createGlobeCache({
   followingTimeoutMs = FOLLOWING_TIMEOUT_MS,
 } = {}) {
   const state = loadState();
+  let ownersByTopic = new Map();
   let running = null;
   let timer = null;
 
@@ -204,6 +205,7 @@ export function createGlobeCache({
       };
     }
     state.directory = { generation: nextGeneration, revision: nextRevision, accounts };
+    indexDirectory();
     state.builtAt = now();
     persist();
     return true;
@@ -258,6 +260,7 @@ export function createGlobeCache({
       revision: state.directory.revision,
       accounts,
     };
+    indexDirectory();
     state.builtAt = now();
     persist();
   }
@@ -369,6 +372,29 @@ export function createGlobeCache({
     return TOPIC_ID.test(topic) ? topic : '';
   }
 
+  // One owner per topic. The first directory account keeps it.
+  function indexDirectory() {
+    const next = new Map();
+    for (const accountId of Object.keys(state.directory.accounts)) {
+      const topic = topicFor(accountId);
+      if (!topic || next.has(topic)) continue;
+      const row = state.directory.accounts[accountId] || {};
+      next.set(topic, {
+        accountId,
+        username: typeof row.username === 'string' ? row.username : '',
+        profilePic: typeof row.profilePic === 'string' ? row.profilePic : '',
+      });
+    }
+    ownersByTopic = next;
+  }
+
+  function accountForTopic(topicId) {
+    if (typeof topicId !== 'string' || !TOPIC_ID.test(topicId)) return null;
+    return ownersByTopic.get(topicId) || null;
+  }
+
+  indexDirectory();
+
   function present(accounts, topics, source) {
     return {
       accounts: (accounts || []).map((account) => ({
@@ -472,6 +498,7 @@ export function createGlobeCache({
     resolveAccountTopic,
     directoryEntry,
     mirrorAccountExists,
+    accountForTopic,
   };
 }
 
@@ -491,6 +518,10 @@ export function resolveAccountTopic(id) {
 
 export function directoryEntry(id) {
   return globe.directoryEntry(id);
+}
+
+export function accountForTopic(topicId) {
+  return globe.accountForTopic(topicId);
 }
 
 export function mirrorAccountExists(id) {

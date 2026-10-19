@@ -392,3 +392,71 @@ test('a refresh does not overlap itself', async () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a linked directory topic returns its owner and an unlinked topic returns null', async () => {
+  const { dir, file } = tempFile();
+  let generation = 'g';
+  let revision = 1;
+  let settings = [
+    { accountId: '0.0.1', username: 'alla', profilePic: 'https://example.test/a.png', topic: '0.0.100' },
+    { accountId: '0.0.2', username: 'no-topic', profilePic: 'p2', topic: '' },
+    { accountId: '0.0.3', username: 'later', profilePic: 'p3', topic: '0.0.100' },
+  ];
+  const fetchImpl = async (url) => {
+    const u = String(url);
+    if (u.includes('/api/user-settings')) {
+      return jsonResponse({ ready: true, generation, revision, settings });
+    }
+    return jsonResponse({ messages: [], links: {} });
+  };
+  try {
+    const cache = createGlobeCache({
+      fetchImpl,
+      cacheFile: file,
+      listProfiles: async () => ({}),
+      warn: () => {},
+      mirrorUrl: 'https://mirror.test',
+      globeUrl: 'https://globe.test',
+    });
+    assert.equal(cache.accountForTopic('0.0.100'), null);
+    await cache.refresh();
+    assert.deepEqual(cache.accountForTopic('0.0.100'), {
+      accountId: '0.0.1',
+      username: 'alla',
+      profilePic: 'https://example.test/a.png',
+    });
+    assert.equal(cache.accountForTopic('0.0.200'), null);
+    assert.equal(cache.accountForTopic('0.0.2'), null);
+
+    generation = 'g2';
+    revision = 1;
+    settings = [
+      { accountId: '0.0.1', username: 'alla', profilePic: 'https://example.test/b.png', topic: '0.0.101' },
+    ];
+    await cache.refresh();
+    assert.equal(cache.accountForTopic('0.0.100'), null);
+    assert.deepEqual(cache.accountForTopic('0.0.101'), {
+      accountId: '0.0.1',
+      username: 'alla',
+      profilePic: 'https://example.test/b.png',
+    });
+
+    const loaded = createGlobeCache({
+      fetchImpl: async () => {
+        throw new Error('loaded cache must not fetch');
+      },
+      cacheFile: file,
+      warn: () => {},
+      mirrorUrl: 'https://mirror.test',
+      globeUrl: 'https://globe.test',
+    });
+    assert.deepEqual(loaded.accountForTopic('0.0.101'), {
+      accountId: '0.0.1',
+      username: 'alla',
+      profilePic: 'https://example.test/b.png',
+    });
+    assert.equal(loaded.accountForTopic('0.0.100'), null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

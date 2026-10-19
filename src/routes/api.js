@@ -16,6 +16,7 @@ import { hederaListener } from '../services/hederaListener.js';
 import { usernameService } from '../services/usernameService.js'; // ← make sure the path is correct
 import { domainForTopic, listDomains, resolveTopicInput } from '../services/domains.js';
 import {
+  accountForTopic,
   directoryEntry,
   getFollowing,
   isAccountId,
@@ -279,9 +280,6 @@ router.post('/update-filter', async (req, res) => {
 router.get('/subscriptions/:walletAddress', async (req, res) => {
   const walletAddress = req.params.walletAddress;
 
-  console.log('PARAMS:', req.params);
-  console.log('Looking up wallet:', walletAddress);
-
   let data;
   try {
     data = listSubscriptions(walletAddress);
@@ -290,11 +288,12 @@ router.get('/subscriptions/:walletAddress', async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 
-  console.log('Result:', data);
-
   res.json({
     success: true,
-    subscriptions: data,
+    subscriptions: data.map((row) => ({
+      ...row,
+      owner: accountForTopic(row.topic_id),
+    })),
   });
 });
 
