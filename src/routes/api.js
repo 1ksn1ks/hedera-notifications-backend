@@ -16,12 +16,12 @@ import { hederaListener } from '../services/hederaListener.js';
 import { usernameService } from '../services/usernameService.js'; // ← make sure the path is correct
 import { domainForTopic, listDomains, resolveTopicInput } from '../services/domains.js';
 import {
-  accountForTopic,
   directoryEntry,
   getFollowing,
   isAccountId,
   mirrorAccountExists,
   resolveAccountTopic,
+  subscriptionOwner,
 } from '../services/globeCache.js';
 
 const router = express.Router();
@@ -105,6 +105,7 @@ router.post('/subscribe', async (req, res) => {
       deviceToken,
       walletAddress,
       topicId: topicToStore,
+      viaAccount,
     });
   } catch (error) {
     console.error(error);
@@ -294,7 +295,10 @@ router.get('/subscriptions/:walletAddress', async (req, res) => {
     success: true,
     subscriptions: data.map((row) => ({
       ...row,
-      owner: accountForTopic(row.topic_id),
+      owner: subscriptionOwner(
+        row.via_account,
+        row.via_account ? directoryEntry(row.via_account) : null,
+      ),
     })),
   });
 });

@@ -39,6 +39,7 @@ db.exec(`
     allowed_senders TEXT NOT NULL DEFAULT '[]',
     blocked_senders TEXT NOT NULL DEFAULT '[]',
     required_nfts TEXT NOT NULL DEFAULT '[]',
+    via_account TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     UNIQUE(wallet_address, topic_id)
   );
@@ -72,11 +73,19 @@ db.exec(`
 `);
 
 export function ensureTopicSubscriptionColumns(database) {
-  const columns = database.prepare('PRAGMA table_info(topic_subscriptions)').all();
-  if (columns.some(column => column.name === 'required_nfts')) return;
-  database.exec(
-    "ALTER TABLE topic_subscriptions ADD COLUMN required_nfts TEXT NOT NULL DEFAULT '[]'"
+  const names = new Set(
+    database.prepare('PRAGMA table_info(topic_subscriptions)').all().map(column => column.name)
   );
+  if (!names.has('required_nfts')) {
+    database.exec(
+      "ALTER TABLE topic_subscriptions ADD COLUMN required_nfts TEXT NOT NULL DEFAULT '[]'"
+    );
+  }
+  if (!names.has('via_account')) {
+    database.exec(
+      "ALTER TABLE topic_subscriptions ADD COLUMN via_account TEXT NOT NULL DEFAULT ''"
+    );
+  }
 }
 
 ensureTopicSubscriptionColumns(db);
@@ -109,6 +118,7 @@ function subscriptionFromRow(row) {
     allowed_senders: parseList(row.allowed_senders),
     blocked_senders: parseList(row.blocked_senders),
     required_nfts: parseList(row.required_nfts),
+    via_account: typeof row.via_account === 'string' ? row.via_account : '',
   };
 }
 
@@ -128,15 +138,47 @@ export function updateTopicDeviceTokens(walletAddress, deviceToken) {
   `).run(deviceToken, walletAddress);
 }
 
-export function upsertTopicSubscription({ walletAddress, deviceToken, topicId }) {
-  db.prepare(`
+export function upsertTopicSubscription({
+  walletAddress,
+  deviceToken,
+  topicId,
+  viaAccount,
+}, database = db) {
+  // A plain re-subscribe leaves a saved account in place. Adding through an account sets it.
+  const account = typeof viaAccount === 'string' ? viaAccount.trim() : '';
+  database.prepare(`
     INSERT INTO topic_subscriptions (
-      id, wallet_address, topic_id, device_token, created_at
+      id, wallet_address, topic_id, device_token, via_account, created_at
     )
-    VALUES (?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(wallet_address, topic_id) DO UPDATE SET
-      device_token = excluded.device_token
-  `).run(randomUUID(), walletAddress, topicId, deviceToken, now());
+      device_token = excluded.device_token,
+      via_account = CASE
+        WHEN excluded.via_account <> '' THEN excluded.via_account
+        ELSE topic_subscriptions.via_account
+      END
+  `).run(randomUUID(), walletAddress, topicId, deviceToken, account, now());
+}
+
+// Existing rows predate via_account. Set it only when one directory account links the topic.
+export function backfillViaAccounts(accountsForTopic, database = db) {
+  const rows = database.prepare(`
+    SELECT wallet_address, topic_id
+    FROM topic_subscriptions
+    WHERE via_account = ''
+  `).all();
+  const update = database.prepare(`
+    UPDATE topic_subscriptions
+    SET via_account = ?
+    WHERE wallet_address = ? AND topic_id = ? AND via_account = ''
+  `);
+  for (const row of rows) {
+    const ids = accountsForTopic(row.topic_id);
+    if (!Array.isArray(ids) || ids.length !== 1) continue;
+    const accountId = ids[0];
+    if (typeof accountId !== 'string' || accountId === '') continue;
+    update.run(accountId, row.wallet_address, row.topic_id);
+  }
 }
 
 export function deleteTopicSubscription(walletAddress, topicId) {
@@ -215,7 +257,7 @@ export function updateTopicFilter({
 
 export function listSubscriptions(walletAddress) {
   return db.prepare(`
-    SELECT topic_id, show_full_message, filter_mode, allowed_senders, blocked_senders, required_nfts, wallet_address
+    SELECT topic_id, show_full_message, filter_mode, allowed_senders, blocked_senders, required_nfts, via_account, wallet_address
     FROM topic_subscriptions
     WHERE wallet_address = ?
   `).all(walletAddress).map(subscriptionFromRow);

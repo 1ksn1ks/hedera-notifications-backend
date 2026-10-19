@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { createGlobeCache, isAccountId, profileTopicAction } from './globeCache.js';
+import { createGlobeCache, isAccountId, profileTopicAction, subscriptionOwner } from './globeCache.js';
 
 function jsonResponse(body, status = 200) {
   return {
@@ -425,7 +425,15 @@ test('a linked directory topic returns its owner and an unlinked topic returns n
       username: 'alla',
       profilePic: 'https://example.test/a.png',
     });
+    assert.deepEqual(cache.accountsForTopic('0.0.100'), ['0.0.1', '0.0.3']);
+    assert.equal(subscriptionOwner('', cache.directoryEntry('0.0.1')), null);
+    assert.deepEqual(subscriptionOwner('0.0.9', null), {
+      accountId: '0.0.9',
+      username: '',
+      profilePic: '',
+    });
     assert.equal(cache.accountForTopic('0.0.200'), null);
+    assert.deepEqual(cache.accountsForTopic('0.0.200'), []);
     assert.equal(cache.accountForTopic('0.0.2'), null);
 
     generation = 'g2';
@@ -440,6 +448,8 @@ test('a linked directory topic returns its owner and an unlinked topic returns n
       username: 'alla',
       profilePic: 'https://example.test/b.png',
     });
+    assert.deepEqual(cache.accountsForTopic('0.0.101'), ['0.0.1']);
+    assert.deepEqual(cache.accountsForTopic('0.0.100'), []);
 
     const loaded = createGlobeCache({
       fetchImpl: async () => {

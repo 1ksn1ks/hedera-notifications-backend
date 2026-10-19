@@ -3,7 +3,7 @@
 // Globe's following route is unavailable.
 import fs from 'fs';
 import path from 'path';
-import { dbPath } from '../utils/db.js';
+import { backfillViaAccounts, dbPath } from '../utils/db.js';
 
 export const GLOBE_API_URL = process.env.GLOBE_API_URL || 'https://onlyonhbar.com';
 
@@ -92,9 +92,12 @@ export function createGlobeCache({
   followingTtlMs = FOLLOWING_TTL_MS,
   jobTimeoutMs = JOB_TIMEOUT_MS,
   followingTimeoutMs = FOLLOWING_TIMEOUT_MS,
+  backfillOwners = null,
 } = {}) {
   const state = loadState();
   let ownersByTopic = new Map();
+  let linksByTopic = new Map();
+  let ownersBackfilled = false;
   let running = null;
   let timer = null;
 
@@ -347,6 +350,7 @@ export function createGlobeCache({
     } catch (err) {
       warn(`Globe follow mirror read failed; keeping the previous pairs. ${errorText(err)}`);
     }
+    backfillOwnersOnce();
   }
 
   function refresh() {
@@ -372,12 +376,18 @@ export function createGlobeCache({
     return TOPIC_ID.test(topic) ? topic : '';
   }
 
-  // One owner per topic. The first directory account keeps it.
+  // One displayed owner per topic. The first directory account keeps it.
+  // linksByTopic keeps every account so a shared topic is not treated as unique.
   function indexDirectory() {
     const next = new Map();
+    const links = new Map();
     for (const accountId of Object.keys(state.directory.accounts)) {
       const topic = topicFor(accountId);
-      if (!topic || next.has(topic)) continue;
+      if (!topic) continue;
+      const list = links.get(topic);
+      if (list) list.push(accountId);
+      else links.set(topic, [accountId]);
+      if (next.has(topic)) continue;
       const row = state.directory.accounts[accountId] || {};
       next.set(topic, {
         accountId,
@@ -386,11 +396,30 @@ export function createGlobeCache({
       });
     }
     ownersByTopic = next;
+    linksByTopic = links;
   }
 
   function accountForTopic(topicId) {
     if (typeof topicId !== 'string' || !TOPIC_ID.test(topicId)) return null;
     return ownersByTopic.get(topicId) || null;
+  }
+
+  function accountsForTopic(topicId) {
+    if (typeof topicId !== 'string' || !TOPIC_ID.test(topicId)) return [];
+    const list = linksByTopic.get(topicId);
+    return list ? list.slice() : [];
+  }
+
+  function backfillOwnersOnce() {
+    if (ownersBackfilled || typeof backfillOwners !== 'function') return;
+    if (Object.keys(state.directory.accounts).length === 0) return;
+    ownersBackfilled = true;
+    try {
+      backfillOwners(accountsForTopic);
+    } catch (err) {
+      ownersBackfilled = false;
+      warn(`Subscription owner backfill failed. ${errorText(err)}`);
+    }
   }
 
   indexDirectory();
@@ -499,10 +528,22 @@ export function createGlobeCache({
     directoryEntry,
     mirrorAccountExists,
     accountForTopic,
+    accountsForTopic,
   };
 }
 
-const globe = createGlobeCache();
+export function subscriptionOwner(viaAccount, entry) {
+  const accountId = typeof viaAccount === 'string' ? viaAccount.trim() : '';
+  if (!accountId) return null;
+  const row = entry && typeof entry === 'object' ? entry : {};
+  return {
+    accountId,
+    username: typeof row.username === 'string' ? row.username : '',
+    profilePic: typeof row.profilePic === 'string' ? row.profilePic : '',
+  };
+}
+
+const globe = createGlobeCache({ backfillOwners: backfillViaAccounts });
 
 export function startGlobeCache() {
   globe.start();
@@ -522,6 +563,10 @@ export function directoryEntry(id) {
 
 export function accountForTopic(topicId) {
   return globe.accountForTopic(topicId);
+}
+
+export function accountsForTopic(topicId) {
+  return globe.accountsForTopic(topicId);
 }
 
 export function mirrorAccountExists(id) {
