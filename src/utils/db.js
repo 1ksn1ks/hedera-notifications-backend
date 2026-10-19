@@ -7,6 +7,7 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
 import { DatabaseSync } from 'node:sqlite';
+import { normalizeRequiredNfts } from '../services/topicFilter.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const dataDir = process.env.NOTIFIER_DATA_DIR
@@ -37,6 +38,7 @@ db.exec(`
     filter_mode TEXT NOT NULL DEFAULT 'all',
     allowed_senders TEXT NOT NULL DEFAULT '[]',
     blocked_senders TEXT NOT NULL DEFAULT '[]',
+    required_nfts TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     UNIQUE(wallet_address, topic_id)
   );
@@ -69,6 +71,16 @@ db.exec(`
   );
 `);
 
+export function ensureTopicSubscriptionColumns(database) {
+  const columns = database.prepare('PRAGMA table_info(topic_subscriptions)').all();
+  if (columns.some(column => column.name === 'required_nfts')) return;
+  database.exec(
+    "ALTER TABLE topic_subscriptions ADD COLUMN required_nfts TEXT NOT NULL DEFAULT '[]'"
+  );
+}
+
+ensureTopicSubscriptionColumns(db);
+
 console.log(`SQLite ready at ${dbPath}`);
 
 function now() {
@@ -96,6 +108,7 @@ function subscriptionFromRow(row) {
     filter_mode: row.filter_mode || 'all',
     allowed_senders: parseList(row.allowed_senders),
     blocked_senders: parseList(row.blocked_senders),
+    required_nfts: parseList(row.required_nfts),
   };
 }
 
@@ -160,7 +173,14 @@ export function deleteMessages({ walletAddress, ids, topicIds, payers }) {
   }
 }
 
-export function updateTopicFilter({ walletAddress, topicId, filterMode, allowedSenders, blockedSenders }) {
+export function updateTopicFilter({
+  walletAddress,
+  topicId,
+  filterMode,
+  allowedSenders,
+  blockedSenders,
+  requiredNfts,
+}) {
   const sets = [];
   const params = [];
   if (filterMode !== undefined) {
@@ -175,6 +195,16 @@ export function updateTopicFilter({ walletAddress, topicId, filterMode, allowedS
     sets.push('blocked_senders = ?');
     params.push(JSON.stringify(blockedSenders));
   }
+  if (requiredNfts !== undefined) {
+    const parsed = normalizeRequiredNfts(requiredNfts);
+    if (!parsed.ok) {
+      const error = new Error(parsed.error);
+      error.status = 400;
+      throw error;
+    }
+    sets.push('required_nfts = ?');
+    params.push(JSON.stringify(parsed.ids));
+  }
   if (sets.length === 0) return;
   params.push(walletAddress, topicId);
   db.prepare(`
@@ -185,7 +215,7 @@ export function updateTopicFilter({ walletAddress, topicId, filterMode, allowedS
 
 export function listSubscriptions(walletAddress) {
   return db.prepare(`
-    SELECT topic_id, show_full_message, filter_mode, allowed_senders, blocked_senders, wallet_address
+    SELECT topic_id, show_full_message, filter_mode, allowed_senders, blocked_senders, required_nfts, wallet_address
     FROM topic_subscriptions
     WHERE wallet_address = ?
   `).all(walletAddress).map(subscriptionFromRow);
@@ -239,7 +269,7 @@ export function upsertTopicState(topicId, lastSequenceNumber) {
 
 export function listTopicSubscribers(topicId) {
   return db.prepare(`
-    SELECT device_token, wallet_address, show_full_message, allowed_senders, blocked_senders, filter_mode
+    SELECT device_token, wallet_address, show_full_message, allowed_senders, blocked_senders, required_nfts, filter_mode
     FROM topic_subscriptions
     WHERE topic_id = ?
   `).all(topicId).map(subscriptionFromRow);

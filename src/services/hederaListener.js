@@ -3,6 +3,8 @@ import * as HieroProto from '@hiero-ledger/proto';
 import { listTopicSubscribers } from '../utils/db.js';
 import { sendPushNotification } from './notificationService.js';
 import { previewMeritocracy, clipText } from './meritocracyFormat.js';
+import { passesTopicFilter } from './topicFilter.js';
+import { usernameService } from './usernameService.js';
 import {
   acceptTopicMessage,
   createChunkBuffer,
@@ -138,15 +140,17 @@ class HederaListener {
     }
 
     const preview = clipText(previewMeritocracy(msgContent));
+    const payer = assembled.payer || '';
+    const profile = payer
+      ? await usernameService.getProfile(payer)
+      : { username: null };
+    const username = profile.username || '';
 
     for (const sub of subscribers) {
-      if (sub.allowed_senders && sub.allowed_senders.length > 0) {
-        if (!sub.allowed_senders.includes(sender)) {
-          console.log(
-            `Skipping ${sub.device_token} - sender ${sender} not allowed`
-          );
-          continue;
-        }
+      const passes = await passesTopicFilter(sub, { payer, username });
+      if (!passes) {
+        console.log(`Skipping ${sub.device_token} - sender ${sender} filtered`);
+        continue;
       }
 
       const body = sub.show_full_message

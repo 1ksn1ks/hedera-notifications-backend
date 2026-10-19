@@ -9,6 +9,7 @@ import {
 import { sendPushNotification } from './notificationService.js';
 import { usernameService } from './usernameService.js';
 import { previewMeritocracy, clipText } from './meritocracyFormat.js';
+import { passesTopicFilter } from './topicFilter.js';
 import {
   acceptTopicMessage,
   createChunkBuffer,
@@ -173,31 +174,13 @@ class TopicPoller {
     if (!subscribers || subscribers.length === 0) return;
   
     for (const sub of subscribers) {
-      const mode = sub.filter_mode || 'all';
-      const allowed = sub.allowed_senders || [];
-      const blocked = sub.blocked_senders || [];
-  
-      // Filtering
-      if (mode === 'allowlist') {
-        const isAllowed =
-          (payer && allowed.includes(payer)) ||
-          (username && allowed.includes(username));
-  
-        if (!isAllowed) {
-          console.log(`Skipping ${sub.device_token} - ${displaySender} not in allow list`);
-          continue;
-        }
-      }
-  
-      if (mode === 'blocklist') {
-        const isBlocked =
-          (payer && blocked.includes(payer)) ||
-          (username && blocked.includes(username));
-  
-        if (isBlocked) {
-          console.log(`Skipping ${sub.device_token} - ${displaySender} is blocked`);
-          continue;
-        }
+      const passes = await passesTopicFilter(sub, {
+        payer: payer || '',
+        username: username || '',
+      });
+      if (!passes) {
+        console.log(`Skipping ${sub.device_token} - ${displaySender} filtered`);
+        continue;
       }
   
       // Save to personal feed

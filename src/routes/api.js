@@ -256,7 +256,7 @@ router.post('/messages/delete', async (req, res) => {
 });
 
 router.post('/update-filter', async (req, res) => {
-  const { walletAddress, topicId, filterMode, allowedSenders, blockedSenders } = req.body;
+  const { walletAddress, topicId, filterMode, allowedSenders, blockedSenders, requiredNfts } = req.body;
 
   if (!walletAddress || !topicId) {
     return res.status(400).json({ error: 'Missing data' });
@@ -269,8 +269,10 @@ router.post('/update-filter', async (req, res) => {
       filterMode,
       allowedSenders,
       blockedSenders,
+      requiredNfts,
     });
   } catch (error) {
+    if (error.status === 400) return res.status(400).json({ error: error.message });
     return res.status(500).json({ error: error.message });
   }
 
