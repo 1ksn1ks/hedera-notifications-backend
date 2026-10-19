@@ -13,8 +13,11 @@ const MIRROR_URL = isMainnet
 const TOKEN_ID = /^0\.0\.\d+$/;
 const MAX_REQUIRED_NFTS = 20;
 const CACHE_TTL_MS = 10 * 60 * 1000;
+const MISS_TTL_MS = 60 * 1000;
 const CACHE_LIMIT = 20000;
 const FETCH_TIMEOUT_MS = 8000;
+const MAX_LOOKUPS = 5;
+const CHECK_BUDGET_MS = 10 * 1000;
 
 export function normalizeRequiredNfts(value) {
   if (!Array.isArray(value)) return { ok: false, error: 'Invalid token id' };
@@ -47,10 +50,11 @@ export function createTopicFilter({
   cacheLimit = CACHE_LIMIT,
 } = {}) {
   const cache = new Map();
+  const inflight = new Map();
 
   function prune(nowMs) {
     for (const [key, entry] of cache) {
-      if (nowMs - entry.at >= cacheTtlMs) cache.delete(key);
+      if (nowMs - entry.at >= entry.ttl) cache.delete(key);
     }
     if (cache.size <= cacheLimit) return;
     const oldest = [...cache.entries()].sort((a, b) => a[1].at - b[1].at);
@@ -58,6 +62,19 @@ export function createTopicFilter({
       if (cache.size <= cacheLimit) break;
       cache.delete(key);
     }
+  }
+
+  function readCache(key) {
+    const cached = cache.get(key);
+    if (!cached) return undefined;
+    if (clock() - cached.at < cached.ttl) return cached.holds;
+    cache.delete(key);
+    return undefined;
+  }
+
+  function remember(key, holds, ttl) {
+    cache.set(key, { holds, at: clock(), ttl });
+    if (cache.size > cacheLimit) prune(clock());
   }
 
   async function fetchHolds(accountId, tokenId) {
@@ -84,25 +101,47 @@ export function createTopicFilter({
     }
   }
 
-  async function holdsToken(accountId, tokenId) {
-    const nowMs = clock();
+  function holdsToken(accountId, tokenId) {
     const key = `${accountId}\n${tokenId}`;
-    const cached = cache.get(key);
-    if (cached) {
-      if (nowMs - cached.at < cacheTtlMs) return cached.holds;
-      cache.delete(key);
-    }
-    const holds = await fetchHolds(accountId, tokenId);
-    cache.set(key, { holds, at: clock() });
-    if (cache.size > cacheLimit) prune(clock());
-    return holds;
+    const cached = readCache(key);
+    if (cached !== undefined) return Promise.resolve(cached);
+    const pending = inflight.get(key);
+    if (pending) return pending;
+    const lookup = (async () => {
+      try {
+        const holds = await fetchHolds(accountId, tokenId);
+        remember(key, holds, cacheTtlMs);
+        return holds;
+      } catch {
+        remember(key, false, MISS_TTL_MS);
+        return false;
+      } finally {
+        inflight.delete(key);
+      }
+    })();
+    inflight.set(key, lookup);
+    return lookup;
   }
 
+  // Cache hits are free. A message spends at most five mirror lookups and ten seconds.
   async function holdsAny(accountId, tokenIds) {
     if (!TOKEN_ID.test(accountId)) return false;
+    const started = clock();
+    let lookups = 0;
     for (const tokenId of tokenIds) {
       if (!TOKEN_ID.test(tokenId)) continue;
-      if (await holdsToken(accountId, tokenId)) return true;
+      if (clock() - started >= CHECK_BUDGET_MS) return false;
+      const key = `${accountId}\n${tokenId}`;
+      const cached = readCache(key);
+      if (cached !== undefined) {
+        if (cached) return true;
+        continue;
+      }
+      if (lookups >= MAX_LOOKUPS) return false;
+      lookups += 1;
+      const holds = await holdsToken(accountId, tokenId);
+      if (clock() - started >= CHECK_BUDGET_MS) return false;
+      if (holds) return true;
     }
     return false;
   }
