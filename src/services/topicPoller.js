@@ -222,7 +222,7 @@ class TopicPoller {
         : `New message from ${displaySender}`;
   
       // Stored body is the full consensus text. A chunked push carries
-      // only the clipped preview so a long message stays a small payload.
+      // a small JSON document the phone can still classify.
       if (sub.device_token) {
         await sendPushNotification(
           sub.device_token,

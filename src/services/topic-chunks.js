@@ -1,10 +1,11 @@
 // Joins Hedera consensus-topic chunks (mirror chunk_info) into one message.
 // Bytes are concatenated only. Nothing here decrypts.
 
-import { clipText } from './meritocracyFormat.js';
+import { classifyMeritocracy, clipText, previewMeritocracy } from './meritocracyFormat.js';
 
 export const CHUNK_TTL_MS = 10 * 60 * 1000;
 const DONE_KEEP = 2000;
+const PUSH_LIMIT = 3 * 1024;
 
 export function createChunkBuffer() {
   return {
@@ -57,6 +58,27 @@ function sequenceKey(topicId, sequenceNumber) {
   return `${topicId}\nseq:${sequenceNumber}`;
 }
 
+function initialAccount(info) {
+  const id = info?.initial_transaction_id;
+  if (typeof id === 'string') {
+    const match = id.trim().match(/^(\d+\.\d+\.\d+)/);
+    return match ? match[1] : null;
+  }
+  if (id && typeof id === 'object' && id.account_id != null) {
+    const account = String(id.account_id).trim();
+    return account || null;
+  }
+  return null;
+}
+
+// A chunk paid by someone else is not part of this message.
+function chunkPayerOk(row) {
+  const account = initialAccount(row?.chunk_info);
+  if (!account) return true;
+  const payer = row.payer_account_id == null ? '' : String(row.payer_account_id).trim();
+  return payer === account;
+}
+
 function messageBytes(message) {
   if (Buffer.isBuffer(message)) return Buffer.from(message);
   if (message instanceof Uint8Array) return Buffer.from(message);
@@ -98,6 +120,7 @@ export function acceptTopicMessage(buffer, topicId, row, now = Date.now()) {
 
   const plan = chunkPlan(row.chunk_info);
   if (plan?.invalid) return null;
+  if (row.chunk_info && !chunkPayerOk(row)) return null;
 
   if (!plan) {
     const key = initialKey(topicId, row.chunk_info) || sequenceKey(topicId, row.sequence_number);
@@ -146,9 +169,58 @@ export function acceptTopicMessage(buffer, topicId, row, now = Date.now()) {
   };
 }
 
-// The banner already uses clipText. A chunked push also sends only that
-// much of the joined text, so a long message stays a small notification.
+function chatFallback(text) {
+  return JSON.stringify({ userMessage: clipText(previewMeritocracy(text)) });
+}
+
+// Rebuild only the fields classifyMeritocracy reads, with long text clipped
+// and inline image data already dropped by that reader.
+function slimView(view) {
+  if (view.kind === 'chat') {
+    return { userMessage: clipText(view.text) };
+  }
+  if (view.kind === 'encrypted-chat') {
+    return { encryptedMessage: { ciphertext: '' } };
+  }
+  if (view.kind === 'encrypted') {
+    return { ciphertext: '' };
+  }
+  if (view.kind === 'marker-delete') {
+    return { marker: { data: { deleteMarkerNumber: view.number } } };
+  }
+  if (view.kind === 'polygon-delete') {
+    return { polygon: { data: { deletePolygonNumber: view.number } } };
+  }
+  if (view.shared) {
+    const share = { kind: view.kind === 'polygon' ? 'polygon' : 'marker' };
+    if (view.placeTopic) share.topic = view.placeTopic;
+    if (view.placePayer) share.payer = view.placePayer;
+    if (view.number) share.number = view.number;
+    if (view.title) share.title = view.title;
+    if (view.text) share.msg = clipText(view.text);
+    if (view.cord) share.cord = view.cord;
+    if (view.image) share.image = view.image;
+    return { share };
+  }
+  const data = {};
+  if (view.title) data.title = view.title;
+  if (view.text) data.msg = clipText(view.text);
+  if (view.cord) data.cord = view.cord;
+  if (view.image) data.image = view.image;
+  const numberKey = view.kind === 'polygon' ? 'numberOfPolygon' : 'numberOfMarker';
+  if (view.number) data[numberKey] = view.number;
+  const placeKey = view.kind === 'polygon' ? 'polygon' : 'marker';
+  return { [placeKey]: { data } };
+}
+
+// Unchunked pushes stay the raw consensus text. A chunked push is a small
+// JSON document the phone can still classify, never a clipped fragment.
 export function pushMessageText(body, chunked) {
   const text = body == null ? '' : String(body);
-  return chunked ? clipText(text) : text;
+  if (!chunked) return text;
+  const view = classifyMeritocracy(text);
+  if (!view) return chatFallback(text);
+  const json = JSON.stringify(slimView(view));
+  if (Buffer.byteLength(json, 'utf8') >= PUSH_LIMIT) return chatFallback(text);
+  return json;
 }

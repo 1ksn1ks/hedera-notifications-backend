@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { clipText } from './meritocracyFormat.js';
+import { classifyMeritocracy, clipText } from './meritocracyFormat.js';
 import {
   CHUNK_TTL_MS,
   acceptTopicMessage,
@@ -47,21 +47,21 @@ test('out-of-order chunks join once, using the first chunk payer and time', () =
 
   const second = take(buffer, chunk(2, 2, tail, {
     consensus_timestamp: '1700000002.000000000',
-    payer_account_id: '0.0.222',
+    payer_account_id: '0.0.100',
     sequence_number: 12,
   }));
   assert.equal(second, null);
 
   const message = take(buffer, chunk(1, 2, head, {
     consensus_timestamp: '1700000001.000000000',
-    payer_account_id: '0.0.111',
+    payer_account_id: '0.0.100',
     sequence_number: 11,
   }));
   if (message) seen.push(message);
 
   assert.equal(seen.length, 1);
   assert.equal(message.body, secret);
-  assert.equal(message.payer, '0.0.111');
+  assert.equal(message.payer, '0.0.100');
   assert.equal(message.consensusTimestamp, '1700000001.000000000');
   assert.equal(message.sequenceNumber, 11);
   assert.equal(message.chunked, true);
@@ -73,12 +73,12 @@ test('a missing chunk never produces a message', () => {
   const seen = [];
   const first = chunk(1, 2, 'hello ', {
     consensus_timestamp: '1700000001.000000000',
-    payer_account_id: '0.0.111',
+    payer_account_id: '0.0.100',
     sequence_number: 11,
   });
   const late = chunk(2, 2, 'there', {
     consensus_timestamp: '1700000099.000000000',
-    payer_account_id: '0.0.111',
+    payer_account_id: '0.0.100',
     sequence_number: 12,
   });
 
@@ -103,12 +103,12 @@ test('duplicate chunks and a repeated full message notify once', () => {
   };
   const first = chunk(1, 2, 'aa', {
     consensus_timestamp: '1700000001.000000000',
-    payer_account_id: '0.0.111',
+    payer_account_id: '0.0.100',
     sequence_number: 11,
   });
   const second = chunk(2, 2, 'bb', {
     consensus_timestamp: '1700000002.000000000',
-    payer_account_id: '0.0.222',
+    payer_account_id: '0.0.100',
     sequence_number: 12,
   });
 
@@ -151,24 +151,146 @@ test('a message without chunk_info is unchanged', () => {
   assert.equal(pushMessageText(message.body, message.chunked), text);
 });
 
-test('a long joined message is trimmed to the current preview length for the push', () => {
+test('a chunk whose payer does not match the initial account is dropped', () => {
   const buffer = createChunkBuffer();
-  const text = 'm'.repeat(180);
-  const head = text.slice(0, 90);
-  const tail = text.slice(90);
+  const text = '{"userMessage":"hi there"}';
+  const head = text.slice(0, 12);
+  const tail = text.slice(12);
+  const matching = {
+    consensus_timestamp: '1700000001.000000000',
+    payer_account_id: '0.0.100',
+    sequence_number: 11,
+  };
+  const foreign = {
+    consensus_timestamp: '1700000002.000000000',
+    payer_account_id: '0.0.999',
+    sequence_number: 12,
+  };
+
+  assert.equal(take(buffer, chunk(1, 2, head, matching)), null);
+  assert.equal(take(buffer, chunk(2, 2, tail, foreign)), null);
+  const message = take(buffer, chunk(2, 2, tail, {
+    ...matching,
+    sequence_number: 13,
+    consensus_timestamp: '1700000003.000000000',
+  }));
+  assert.equal(message.body, text);
+  assert.equal(message.payer, '0.0.100');
+});
+
+function joinedPush(original) {
+  const text = JSON.stringify(original);
+  const buffer = createChunkBuffer();
+  const head = text.slice(0, Math.ceil(text.length / 2));
+  const tail = text.slice(head.length);
   assert.equal(take(buffer, chunk(2, 2, tail, {
     consensus_timestamp: '2.000000000',
-    payer_account_id: '0.0.2',
+    payer_account_id: '0.0.100',
     sequence_number: 2,
   })), null);
   const message = take(buffer, chunk(1, 2, head, {
     consensus_timestamp: '1.000000000',
-    payer_account_id: '0.0.1',
+    payer_account_id: '0.0.100',
     sequence_number: 1,
   }));
-
   assert.equal(message.body, text);
-  assert.equal(pushMessageText(message.body, message.chunked), clipText(text));
-  assert.ok(pushMessageText(message.body, true).length < text.length);
+  const pushed = pushMessageText(message.body, message.chunked);
+  const parsed = JSON.parse(pushed);
+  assert.equal(typeof parsed, 'object');
+  assert.ok(parsed);
+  assert.ok(Buffer.byteLength(pushed, 'utf8') < 3 * 1024);
+  assert.equal(classifyMeritocracy(pushed).kind, classifyMeritocracy(text).kind);
+  return pushed;
+}
+
+test('a chunked push is small JSON that classifies as the original kind', () => {
+  const blob = 'data:image/png;base64,' + 'A'.repeat(4000);
+  const long = 'm'.repeat(180);
+
+  const chat = joinedPush({
+    userMessage: long,
+    image: blob,
+  });
+  assert.equal(JSON.parse(chat).userMessage, clipText(long));
+  assert.equal(chat.includes(blob), false);
+
+  const secret = 'c'.repeat(500);
+  const encryptedChat = joinedPush({
+    encryptedMessage: { ciphertext: secret, iv: 'abc' },
+  });
+  assert.equal(classifyMeritocracy(encryptedChat).kind, 'encrypted-chat');
+  assert.equal(encryptedChat.includes(secret), false);
+  assert.deepEqual(JSON.parse(encryptedChat), { encryptedMessage: { ciphertext: '' } });
+
+  const sealed = joinedPush({ ciphertext: secret });
+  assert.equal(classifyMeritocracy(sealed).kind, 'encrypted');
+  assert.equal(sealed.includes(secret), false);
+  assert.deepEqual(JSON.parse(sealed), { ciphertext: '' });
+
+  const marker = joinedPush({
+    marker: {
+      data: {
+        title: 'Cafe',
+        msg: long,
+        cord: '1.5,2.5',
+        numberOfMarker: 9,
+        image: blob,
+        coverimage: 'https://example.test/pic.jpg',
+      },
+    },
+  });
+  assert.equal(classifyMeritocracy(marker).kind, 'marker');
+  assert.equal(marker.includes(blob), false);
+  assert.equal(JSON.parse(marker).marker.data.image, 'https://example.test/pic.jpg');
+  assert.equal(JSON.parse(marker).marker.data.msg, clipText(long));
+
+  joinedPush({
+    polygon: {
+      data: {
+        title: 'Block',
+        msg: 'ring',
+        cord: '1,2,3,4,5,6',
+        numberOfPolygon: 3,
+        image: blob,
+      },
+    },
+  });
+
+  joinedPush({ marker: { data: { deleteMarkerNumber: 12 } } });
+  joinedPush({ polygon: { data: { deletePolygonNumber: 4 } } });
+
+  const share = joinedPush({
+    share: {
+      topic: '0.0.4819200',
+      payer: '0.0.111',
+      number: 7,
+      kind: 'marker',
+      coords: [[1, 2], [3, 4], [5, 6]],
+      title: 'Park',
+      msg: long,
+      image: blob,
+    },
+  });
+  assert.equal(classifyMeritocracy(share).kind, 'polygon');
+  assert.equal(classifyMeritocracy(share).shared, true);
+  assert.equal(share.includes(blob), false);
+});
+
+test('a chunked push that is not classifiable JSON is a small chat preview', () => {
+  const text = 'm'.repeat(180);
+  const pushed = pushMessageText(text, true);
+  const view = classifyMeritocracy(pushed);
+  assert.equal(view.kind, 'chat');
+  assert.equal(view.text, clipText(text));
+  assert.ok(Buffer.byteLength(pushed, 'utf8') < 3 * 1024);
   assert.equal(pushMessageText(text, false), text);
+
+  const huge = JSON.stringify({
+    marker: { data: { title: 'Big', msg: 'hi', cord: '1,2,'.repeat(2000), numberOfMarker: 1 } },
+  });
+  assert.equal(classifyMeritocracy(huge).kind, 'marker');
+  const fallback = pushMessageText(huge, true);
+  assert.equal(classifyMeritocracy(fallback).kind, 'chat');
+  assert.ok(Buffer.byteLength(fallback, 'utf8') < 3 * 1024);
+  JSON.parse(fallback);
 });
