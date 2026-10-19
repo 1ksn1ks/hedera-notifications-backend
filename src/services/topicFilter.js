@@ -174,3 +174,68 @@ const topicFilter = createTopicFilter();
 export function passesTopicFilter(subscription, sender) {
   return topicFilter.passes(subscription, sender);
 }
+
+export function createNftTypeCheck({
+  fetchImpl = globalThis.fetch,
+  mirrorUrl = MIRROR_URL,
+  timeoutMs = FETCH_TIMEOUT_MS,
+} = {}) {
+  const types = new Map();
+
+  async function tokenType(tokenId) {
+    if (types.has(tokenId)) return types.get(tokenId);
+    const controller = new AbortController();
+    let timerId;
+    const timeout = new Promise((_, reject) => {
+      timerId = setTimeout(() => {
+        controller.abort();
+        reject(new Error('Timed out'));
+      }, timeoutMs);
+    });
+    const url = `${mirrorUrl}/api/v1/tokens/${encodeURIComponent(tokenId)}`;
+    try {
+      const res = await Promise.race([
+        fetchImpl(url, { signal: controller.signal }),
+        timeout,
+      ]);
+      if (!res.ok) {
+        if (res.status >= 500 || res.status === 429) throw new Error(`HTTP ${res.status}`);
+        types.set(tokenId, '');
+        return '';
+      }
+      const json = await Promise.race([res.json(), timeout]);
+      const type = json && typeof json.type === 'string' ? json.type : '';
+      if (!type) throw new Error('Bad token response');
+      types.set(tokenId, type);
+      return type;
+    } finally {
+      clearTimeout(timerId);
+    }
+  }
+
+  async function assertNftTokens(ids) {
+    for (const id of ids) {
+      let type;
+      try {
+        type = await tokenType(id);
+      } catch {
+        const error = new Error('Could not check the token, try again');
+        error.status = 503;
+        throw error;
+      }
+      if (type !== 'NON_FUNGIBLE_UNIQUE') {
+        const error = new Error(`${id} is not an NFT`);
+        error.status = 400;
+        throw error;
+      }
+    }
+  }
+
+  return { assertNftTokens };
+}
+
+const nftTypes = createNftTypeCheck();
+
+export function assertNftTokens(ids) {
+  return nftTypes.assertNftTokens(ids);
+}

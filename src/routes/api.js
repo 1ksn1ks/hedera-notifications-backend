@@ -23,6 +23,7 @@ import {
   resolveAccountTopic,
   subscriptionOwner,
 } from '../services/globeCache.js';
+import { assertNftTokens, normalizeRequiredNfts } from '../services/topicFilter.js';
 
 const router = express.Router();
 
@@ -264,6 +265,15 @@ router.post('/update-filter', async (req, res) => {
   }
 
   try {
+    if (Array.isArray(requiredNfts)) {
+      const normalized = normalizeRequiredNfts(requiredNfts);
+      if (!normalized.ok) return res.status(400).json({ error: normalized.error });
+      const rows = listSubscriptions(walletAddress);
+      const row = Array.isArray(rows) ? rows.find(item => item.topic_id === topicId) : null;
+      const saved = row && Array.isArray(row.required_nfts) ? row.required_nfts : [];
+      const known = new Set(saved);
+      await assertNftTokens(normalized.ids.filter(id => !known.has(id)));
+    }
     updateTopicFilter({
       walletAddress,
       topicId,
@@ -273,7 +283,9 @@ router.post('/update-filter', async (req, res) => {
       requiredNfts,
     });
   } catch (error) {
-    if (error.status === 400) return res.status(400).json({ error: error.message });
+    if (error.status === 400 || error.status === 503) {
+      return res.status(error.status).json({ error: error.message });
+    }
     return res.status(500).json({ error: error.message });
   }
 
