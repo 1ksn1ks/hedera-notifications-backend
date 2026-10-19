@@ -12,7 +12,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const dataDir = process.env.NOTIFIER_DATA_DIR
   || process.env.RAILWAY_VOLUME_MOUNT_PATH
   || path.join(root, 'data');
-const dbPath = process.env.NOTIFIER_DB || path.join(dataDir, 'notifier.db');
+export const dbPath = process.env.NOTIFIER_DB || path.join(dataDir, 'notifier.db');
 
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 

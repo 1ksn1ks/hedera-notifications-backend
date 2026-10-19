@@ -4,6 +4,7 @@ import { db } from './utils/db.js';
 import apiRoutes from './routes/api.js';
 import { initFirebase } from './services/notificationService.js';
 import { topicPoller } from './services/topicPoller.js';
+import { startGlobeCache } from './services/globeCache.js';
 
 const app = express();
 app.use(express.json());
@@ -30,4 +31,5 @@ initFirebase();
 app.listen(config.port, () => {
   console.log(`🚀 Server running on http://localhost:${config.port}`);
   topicPoller.start();
+  startGlobeCache();
 });

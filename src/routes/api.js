@@ -14,7 +14,14 @@ import {
 } from '../utils/db.js';
 import { hederaListener } from '../services/hederaListener.js';
 import { usernameService } from '../services/usernameService.js'; // ← make sure the path is correct
-import { listDomains, resolveTopicInput } from '../services/domains.js';
+import { domainForTopic, listDomains, resolveTopicInput } from '../services/domains.js';
+import {
+  directoryEntry,
+  getFollowing,
+  isAccountId,
+  mirrorAccountExists,
+  resolveAccountTopic,
+} from '../services/globeCache.js';
 
 const router = express.Router();
 
@@ -63,24 +70,118 @@ router.post('/subscribe', async (req, res) => {
     return res.status(400).json({ error: 'Invalid topic format' });
   }
 
-  // Check if topic exists
-  const exists = await hederaListener.topicExists(cleaned);
+  // An account with a Globe profile topic subscribes to that topic.
+  let topicToStore = cleaned;
+  let viaAccount = '';
+  if (isAccountId(cleaned)) {
+    const linked = resolveAccountTopic(cleaned);
+    if (linked) {
+      topicToStore = linked;
+      viaAccount = cleaned;
+    }
+  }
+
+  const exists = await hederaListener.topicExists(topicToStore);
   if (!exists) {
+    if (!viaAccount && isAccountId(cleaned) && await mirrorAccountExists(cleaned)) {
+      return res.status(404).json({ error: `${cleaned} has no public topic connected` });
+    }
     return res.status(404).json({ error: 'Topic does not exist' });
+  }
+
+  let domain = resolved.domain || null;
+  if (viaAccount) {
+    try {
+      domain = domainForTopic(topicToStore, await listDomains()) || null;
+    } catch (error) {
+      console.error('Domain lookup skipped:', error.message);
+      domain = null;
+    }
   }
 
   try {
     upsertTopicSubscription({
       deviceToken,
       walletAddress,
-      topicId: cleaned,
+      topicId: topicToStore,
     });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ error: error.message });
   }
 
-  res.json({ success: true, topicId: cleaned, domain: resolved.domain || null });
+  const body = { success: true, topicId: topicToStore, domain };
+  if (viaAccount) body.viaAccount = viaAccount;
+  res.json(body);
+});
+
+const RESOLVE_TTL_MS = 5 * 60 * 1000;
+const resolveCache = new Map();
+
+router.get('/following/:walletAddress', async (req, res) => {
+  const account = req.params.walletAddress;
+  if (!isAccountId(account)) {
+    return res.status(400).json({ error: 'Invalid account' });
+  }
+
+  try {
+    const result = await getFollowing(account);
+    res.json({
+      success: true,
+      accounts: (result.accounts || []).slice(0, 500),
+      topics: (result.topics || []).slice(0, 500),
+      source: result.source,
+    });
+  } catch (error) {
+    console.error(error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/resolve/:id', async (req, res) => {
+  const id = req.params.id;
+  if (!isAccountId(id)) {
+    return res.status(400).json({ error: 'Invalid id' });
+  }
+
+  const hit = resolveCache.get(id);
+  if (hit && Date.now() - hit.at < RESOLVE_TTL_MS) {
+    return res.status(hit.status).json(hit.body);
+  }
+
+  const linked = resolveAccountTopic(id);
+  let status;
+  let body;
+  if (linked) {
+    const entry = directoryEntry(id) || {};
+    status = 200;
+    body = {
+      success: true,
+      kind: 'account',
+      accountId: id,
+      topicId: linked,
+      username: entry.username || '',
+      profilePic: entry.profilePic || '',
+    };
+  } else if (await hederaListener.topicExists(id)) {
+    let domain = '';
+    try {
+      domain = domainForTopic(id, await listDomains()) || '';
+    } catch (error) {
+      console.error('Domain lookup skipped:', error.message);
+    }
+    status = 200;
+    body = { success: true, kind: 'topic', topicId: id, domain };
+  } else if (await mirrorAccountExists(id)) {
+    status = 404;
+    body = { success: false, kind: 'account', error: `${id} has no public topic connected` };
+  } else {
+    status = 404;
+    body = { success: false, error: 'Not found' };
+  }
+
+  resolveCache.set(id, { at: Date.now(), status, body });
+  res.status(status).json(body);
 });
 
 router.get('/domains', async (req, res) => {
