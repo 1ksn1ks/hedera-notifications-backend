@@ -2,6 +2,18 @@
 // token is saved for it. The client fetches a nonce, has the connected
 // wallet sign it, and posts nonce + signature with the register call.
 // Nonces live in memory, expire after five minutes, and are single use.
+//
+// Signature formats accepted:
+//  - signatureMap: the base64 protobuf SignatureMap returned by
+//    hedera_signMessage (HIP-820). The wallet signs the message with the
+//    prefix "\x19Hedera Signed Message:\n" + length, so both the prefixed
+//    and the plain message are tried.
+//  - raw hex signature (legacy path): 64-byte ED25519, or ECDSA r||s /
+//    r||s||v over the plain message.
+//
+// Grace period: until GRACE_UNTIL (env: ISO date or epoch ms, default
+// 14 days from boot) unsigned registers are accepted with a warning log.
+// A present-but-invalid proof is always 401.
 
 import crypto from 'crypto';
 import { MIRROR_URL } from './globeCache.js';
@@ -9,6 +21,7 @@ import { MIRROR_URL } from './globeCache.js';
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const MAX_PENDING_CHALLENGES = 10000;
 const FETCH_TIMEOUT_MS = 8000;
+const DEFAULT_GRACE_MS = 14 * 24 * 60 * 60 * 1000;
 
 const challenges = new Map(); // account -> { nonce, expiresAt }
 
@@ -25,6 +38,25 @@ export function issueChallenge(account) {
   const nonce = crypto.randomBytes(16).toString('hex');
   challenges.set(account, { nonce, expiresAt: now + CHALLENGE_TTL_MS });
   return nonce;
+}
+
+function parseGraceUntil() {
+  const raw = process.env.GRACE_UNTIL;
+  if (raw) {
+    const parsed = Date.parse(raw);
+    if (!Number.isNaN(parsed)) return parsed;
+    const ms = Number(raw);
+    if (Number.isFinite(ms) && ms > 0) return ms;
+  }
+  return Date.now() + DEFAULT_GRACE_MS;
+}
+
+export function graceUntil() {
+  return parseGraceUntil();
+}
+
+export function unsignedRegisterAllowed() {
+  return Date.now() < parseGraceUntil();
 }
 
 function fail(message, status) {
@@ -81,6 +113,81 @@ async function fetchAccountKey(account, fetchImpl, mirrorUrl) {
     clearTimeout(timerId);
   }
 }
+
+// --- Minimal SignatureMap protobuf decoder (no new dependency). --------
+//
+//   SignatureMap { map<PublicKey, SignaturePair> sig_map = 1; }
+//   PublicKey    { oneof key { bytes ed25519 = 1; bytes secp256k1 = 2; } }
+//   SignaturePair{ oneof signature { bytes ed25519 = 1;
+//                                   bytes ecdsa_secp256k1 = 2; } }
+
+function readVarint(buffer, offset) {
+  let result = 0n;
+  let shift = 0n;
+  let pos = offset;
+  for (;;) {
+    if (pos >= buffer.length) throw new Error('Truncated varint');
+    const byte = buffer[pos++];
+    result |= BigInt(byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) return [result, pos];
+    shift += 7n;
+  }
+}
+
+function readFields(buffer, start, end) {
+  const fields = new Map();
+  let pos = start;
+  while (pos < end) {
+    let tag;
+    [tag, pos] = readVarint(buffer, pos);
+    const field = Number(tag >> 3n);
+    if (Number(tag & 7n) !== 2) throw new Error('Unexpected wire type');
+    let len;
+    [len, pos] = readVarint(buffer, pos);
+    if (pos + Number(len) > end) throw new Error('Truncated field');
+    const value = buffer.subarray(pos, pos + Number(len));
+    fields.set(field, [...(fields.get(field) || []), value]);
+    pos += Number(len);
+  }
+  return fields;
+}
+
+export function decodeSignatureMap(input) {
+  const text = String(input || '').trim();
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(text) || text.length < 12) return null;
+  let buffer;
+  try {
+    buffer = Buffer.from(text, 'base64');
+  } catch {
+    return null;
+  }
+  try {
+    const outer = readFields(buffer, 0, buffer.length);
+    for (const entry of outer.get(1) || []) {
+      const inner = readFields(entry, 0, entry.length);
+      const keyFields = inner.get(1) || [];
+      const sigFields = inner.get(2) || [];
+      if (keyFields.length === 0 || sigFields.length === 0) continue;
+      const keyMap = readFields(keyFields[0], 0, keyFields[0].length);
+      const sigMap = readFields(sigFields[0], 0, sigFields[0].length);
+      const isEd25519Key = keyMap.has(1);
+      // readFields groups repeated fields into arrays, so take the first.
+      const pub = (keyMap.get(1) || keyMap.get(2) || [])[0];
+      const sig = (sigMap.get(1) || sigMap.get(2) || [])[0];
+      if (!pub || !sig) continue;
+      return {
+        isEd25519: isEd25519Key,
+        pub: Buffer.from(pub),
+        sig: Buffer.from(sig),
+      };
+    }
+  } catch {
+    return null; // not a SignatureMap after all
+  }
+  return null;
+}
+
+// --- Key + signature verification. -------------------------------------
 
 // secp256k1 field prime (p ≡ 3 mod 4, so sqrt(a) = a^((p+1)/4)).
 const SECP256K1_P = 2n ** 256n - 2n ** 32n - 977n;
@@ -165,12 +272,7 @@ function derSignature(rs64) {
   return Buffer.concat([Buffer.from([0x30, r.length + s.length]), r, s]);
 }
 
-function verifySignature(accountKey, message, signature) {
-  const sig = hexToBuffer(signature);
-  if (!sig) return false;
-  const keyObject = keyObjectFor(accountKey);
-  if (!keyObject) return false;
-
+function checkSignature(keyObject, accountKey, sig, message) {
   if (accountKey.type === 'ED25519PublicKey') {
     if (sig.length !== 64) return false;
     try {
@@ -202,9 +304,35 @@ export async function verifyWalletSignature(
   if (problem) throw problem;
 
   const key = await fetchAccountKey(account, fetchImpl, mirrorUrl);
-  // The wallet signs the nonce exactly as the client received it.
-  const message = Buffer.from(String(nonce), 'utf8');
-  if (!verifySignature(key, message, signature)) {
-    throw fail('Signature check failed', 401);
+  const keyObject = keyObjectFor(key);
+  if (!keyObject) throw fail("Cannot verify this account's key", 401);
+
+  // The wallet signs the nonce the client sent it (its ASCII bytes),
+  // with or without the HIP-820 prefix — accept either.
+  const plain = Buffer.from(String(nonce), 'utf8');
+  const prefixed = Buffer.concat([
+    Buffer.from('\x19Hedera Signed Message:\n' + plain.length, 'utf8'),
+    plain,
+  ]);
+  const messages = [prefixed, plain];
+
+  // Candidate signatures: the decoded SignatureMap (when the input is one)
+  // plus the legacy raw-hex interpretation.
+  const candidates = [];
+  const decoded = decodeSignatureMap(signature);
+  if (decoded) {
+    const accountIsEd25519 = key.type === 'ED25519PublicKey';
+    const sameKey = decoded.pub.equals(Buffer.from(key.thumbprint, 'hex'));
+    const sameType = decoded.isEd25519 === accountIsEd25519;
+    if (sameKey && sameType) candidates.push(decoded.sig);
   }
+  const rawHex = hexToBuffer(signature);
+  if (rawHex && !candidates.includes(rawHex)) candidates.push(rawHex);
+
+  for (const sig of candidates) {
+    for (const message of messages) {
+      if (checkSignature(keyObject, key, sig, message)) return;
+    }
+  }
+  throw fail('Signature check failed', 401);
 }

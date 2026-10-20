@@ -24,7 +24,12 @@ import {
   subscriptionOwner,
 } from '../services/globeCache.js';
 import { assertNftTokens, isNftTypeCached, normalizeRequiredNfts } from '../services/topicFilter.js';
-import { issueChallenge, verifyWalletSignature } from '../services/registerChallenge.js';
+import {
+  issueChallenge,
+  verifyWalletSignature,
+  unsignedRegisterAllowed,
+  graceUntil,
+} from '../services/registerChallenge.js';
 
 const router = express.Router();
 
@@ -54,19 +59,29 @@ router.post('/register', async (req, res) => {
     return res.status(400).json({ error: 'Missing deviceToken or walletAddress' });
   }
 
-  if (!nonce || !signature) {
-    return res.status(401).json({ error: 'Missing nonce or signature' });
-  }
-
-  try {
-    await verifyWalletSignature({
-      account: walletAddress,
-      nonce: String(nonce),
-      signature: String(signature),
-    });
-  } catch (error) {
-    console.error('register verification failed:', error.message);
-    return res.status(error.status || 401).json({ error: error.message });
+  const unsigned = !nonce && !signature;
+  if (unsigned) {
+    // Grace period: old clients (no challenge flow) keep working until
+    // GRACE_UNTIL. A present-but-invalid proof below is always rejected.
+    if (!unsignedRegisterAllowed()) {
+      return res.status(401).json({ error: 'Missing nonce or signature' });
+    }
+    console.warn(
+      `unsigned register accepted during grace period (until ${new Date(
+        graceUntil()
+      ).toISOString()}): wallet=${walletAddress} token=${String(deviceToken).slice(0, 12)}...`
+    );
+  } else {
+    try {
+      await verifyWalletSignature({
+        account: walletAddress,
+        nonce: String(nonce),
+        signature: String(signature),
+      });
+    } catch (error) {
+      console.error('register verification failed:', error.message);
+      return res.status(error.status || 401).json({ error: error.message });
+    }
   }
 
   try {
