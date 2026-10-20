@@ -7,16 +7,18 @@ import { topicPoller } from './services/topicPoller.js';
 import { startGlobeCache } from './services/globeCache.js';
 
 const app = express();
+// One reverse proxy in front (Railway): trust the closest hop so req.ip is
+// the real client address and not a spoofable X-Forwarded-For value.
+app.set('trust proxy', 1);
 app.use(express.json());
 
-// Simple in-memory per-IP rate limit for the write (POST) endpoints: at most
-// `limit` requests per `windowMs` per IP, 429 beyond that. No dependencies.
+// Simple in-memory per-IP rate limit: at most `limit` requests per
+// `windowMs` per IP, 429 beyond that. No dependencies.
 function createRateLimiter({ limit = 30, windowMs = 60 * 1000 } = {}) {
   const hits = new Map(); // ip -> { start, count } for the current window
   return (req, res, next) => {
     const now = Date.now();
-    const fwd = req.headers['x-forwarded-for'];
-    const ip = (fwd ? String(fwd).split(',')[0].trim() : '') || req.ip || 'unknown';
+    const ip = req.ip || 'unknown';
     let entry = hits.get(ip);
     if (!entry || now - entry.start >= windowMs) {
       entry = { start: now, count: 0 };
@@ -37,9 +39,11 @@ function createRateLimiter({ limit = 30, windowMs = 60 * 1000 } = {}) {
 }
 
 const writeRateLimit = createRateLimiter({ limit: 30, windowMs: 60 * 1000 });
+const challengeRateLimit = createRateLimiter({ limit: 10, windowMs: 60 * 1000 });
 app.use('/api', (req, res, next) =>
   req.method === 'POST' ? writeRateLimit(req, res, next) : next(),
 );
+app.get('/api/register/challenge', challengeRateLimit);
 app.use('/api', apiRoutes);
 
 app.get('/', (req, res) => {

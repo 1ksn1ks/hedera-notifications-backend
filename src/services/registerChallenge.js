@@ -24,12 +24,14 @@ const FETCH_TIMEOUT_MS = 8000;
 // Fixed default so a redeploy never pushes the deadline back.
 const DEFAULT_GRACE_UNTIL_MS = Date.parse('2026-11-03T00:00:00Z');
 
-const challenges = new Map(); // account -> { nonce, expiresAt }
+// Keyed by nonce, not account: several challenges may be pending for the
+// same account and a fresh one does not cancel the previous one.
+const challenges = new Map(); // nonce -> { account, expiresAt }
 
 export function issueChallenge(account) {
   const now = Date.now();
-  for (const [key, entry] of challenges) {
-    if (now >= entry.expiresAt) challenges.delete(key);
+  for (const [nonce, entry] of challenges) {
+    if (now >= entry.expiresAt) challenges.delete(nonce);
   }
   if (challenges.size >= MAX_PENDING_CHALLENGES) {
     const error = new Error('Too many pending challenges, try again');
@@ -37,7 +39,7 @@ export function issueChallenge(account) {
     throw error;
   }
   const nonce = crypto.randomBytes(16).toString('hex');
-  challenges.set(account, { nonce, expiresAt: now + CHALLENGE_TTL_MS });
+  challenges.set(nonce, { account, expiresAt: now + CHALLENGE_TTL_MS });
   return nonce;
 }
 
@@ -69,14 +71,17 @@ function fail(message, status) {
 }
 
 function consumeChallenge(account, nonce) {
-  const entry = challenges.get(account);
+  const key = String(nonce);
+  const entry = challenges.get(key);
   if (!entry) return fail('No challenge for this account, request one first', 401);
+  if (entry.account !== String(account)) {
+    return fail('Challenge was issued for a different account', 401);
+  }
   if (Date.now() >= entry.expiresAt) {
-    challenges.delete(account);
+    challenges.delete(key);
     return fail('Challenge expired, request a new one', 401);
   }
-  if (entry.nonce !== String(nonce)) return fail('Invalid challenge nonce', 401);
-  challenges.delete(account); // single use
+  challenges.delete(key); // single use
   return null;
 }
 
