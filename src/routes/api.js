@@ -24,6 +24,7 @@ import {
   subscriptionOwner,
 } from '../services/globeCache.js';
 import { assertNftTokens, isNftTypeCached, normalizeRequiredNfts } from '../services/topicFilter.js';
+import { issueChallenge, verifyWalletSignature } from '../services/registerChallenge.js';
 
 const router = express.Router();
 
@@ -31,11 +32,41 @@ const router = express.Router();
 // already in the token-type cache, to bound mirror-node load per request.
 const MAX_NEW_TOKENS_PER_UPDATE = 5;
 
+// A register must be preceded by a challenge the caller's wallet signed.
+router.get('/register/challenge', (req, res) => {
+  const account = String(req.query.account || '').trim();
+
+  if (!isAccountId(account)) {
+    return res.status(400).json({ error: 'Missing or invalid account' });
+  }
+
+  try {
+    return res.json({ nonce: issueChallenge(account) });
+  } catch (error) {
+    return res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
 router.post('/register', async (req, res) => {
-  const { deviceToken, platform, walletAddress } = req.body;
+  const { deviceToken, platform, walletAddress, nonce, signature } = req.body;
 
   if (!deviceToken || !walletAddress) {
     return res.status(400).json({ error: 'Missing deviceToken or walletAddress' });
+  }
+
+  if (!nonce || !signature) {
+    return res.status(401).json({ error: 'Missing nonce or signature' });
+  }
+
+  try {
+    await verifyWalletSignature({
+      account: walletAddress,
+      nonce: String(nonce),
+      signature: String(signature),
+    });
+  } catch (error) {
+    console.error('register verification failed:', error.message);
+    return res.status(error.status || 401).json({ error: error.message });
   }
 
   try {
