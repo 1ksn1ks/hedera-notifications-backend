@@ -70,6 +70,17 @@ db.exec(`
     profile_pic TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
   );
+
+  -- Session tokens prove a request belongs to a registered wallet + device
+  -- pair. Only the SHA-256 hash is stored; the token itself is returned to
+  -- the client once at register time.
+  CREATE TABLE IF NOT EXISTS session_tokens (
+    wallet_address TEXT NOT NULL,
+    device_token TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(wallet_address, device_token)
+  );
 `);
 
 export function ensureTopicSubscriptionColumns(database) {
@@ -136,6 +147,24 @@ export function updateTopicDeviceTokens(walletAddress, deviceToken) {
   db.prepare(`
     UPDATE topic_subscriptions SET device_token = ? WHERE wallet_address = ?
   `).run(deviceToken, walletAddress);
+}
+
+export function saveSessionToken(walletAddress, deviceToken, tokenHash) {
+  db.prepare(`
+    INSERT INTO session_tokens (wallet_address, device_token, token_hash, created_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(wallet_address, device_token) DO UPDATE SET
+      token_hash = excluded.token_hash,
+      created_at = excluded.created_at
+  `).run(walletAddress, deviceToken, tokenHash, now());
+}
+
+// Hashes of every token issued for the wallet (one per device). A presented
+// token is accepted when its hash matches any of them.
+export function sessionTokenHashesForWallet(walletAddress) {
+  return db.prepare(
+    'SELECT token_hash FROM session_tokens WHERE wallet_address = ?'
+  ).all(walletAddress).map((row) => row.token_hash);
 }
 
 export function upsertTopicSubscription({

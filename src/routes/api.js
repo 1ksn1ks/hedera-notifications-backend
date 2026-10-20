@@ -12,6 +12,8 @@ import {
   updateShowFullMessage,
   listAllSubscriptions,
   listMessages,
+  saveSessionToken,
+  sessionTokenHashesForWallet,
 } from '../utils/db.js';
 import { hederaListener } from '../services/hederaListener.js';
 import { usernameService } from '../services/usernameService.js'; // ← make sure the path is correct
@@ -37,6 +39,35 @@ const router = express.Router();
 // A /update-filter call may validate at most this many tokens that are not
 // already in the token-type cache, to bound mirror-node load per request.
 const MAX_NEW_TOKENS_PER_UPDATE = 5;
+
+// Session tokens: issued at register, required on the wallet-owned writes.
+// While the register grace period runs, requests without a token are still
+// accepted so old clients keep working; a present-but-invalid token is
+// always 401.
+function bearerToken(req) {
+  const match = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : '';
+}
+
+function sessionTokenProblem(req, walletAddress) {
+  const presented = bearerToken(req);
+  if (!presented) {
+    return unsignedRegisterAllowed() ? null : 'Missing session token';
+  }
+  const presentedHash = crypto.createHash('sha256').update(presented).digest('hex');
+  for (const stored of sessionTokenHashesForWallet(walletAddress)) {
+    if (
+      stored.length === presentedHash.length &&
+      crypto.timingSafeEqual(
+        Buffer.from(stored, 'hex'),
+        Buffer.from(presentedHash, 'hex')
+      )
+    ) {
+      return null;
+    }
+  }
+  return 'Invalid session token';
+}
 
 // A register must be preceded by a challenge the caller's wallet signed.
 router.get('/register/challenge', (req, res) => {
@@ -85,15 +116,23 @@ router.post('/register', async (req, res) => {
     }
   }
 
+  // Issued on every successful register (signed, or unsigned during grace):
+  // the client keeps it and presents it on the wallet-owned writes.
+  const sessionToken = crypto.randomBytes(32).toString('base64url');
   try {
     upsertUser({ walletAddress, deviceToken, platform: platform || 'android' });
     updateTopicDeviceTokens(walletAddress, deviceToken);
+    saveSessionToken(
+      walletAddress,
+      deviceToken,
+      crypto.createHash('sha256').update(sessionToken).digest('hex')
+    );
   } catch (error) {
     console.error(error);
     return res.status(500).json({ error: error.message });
   }
 
-  res.json({ success: true });
+  res.json({ success: true, token: sessionToken });
 });
 
 router.post('/subscribe', async (req, res) => {
@@ -104,6 +143,9 @@ router.post('/subscribe', async (req, res) => {
       error: 'Missing deviceToken, topicId or walletAddress',
     });
   }
+
+  const authProblem = sessionTokenProblem(req, walletAddress);
+  if (authProblem) return res.status(401).json({ error: authProblem });
 
   let resolved;
   try {
@@ -255,6 +297,9 @@ router.post('/unsubscribe', async (req, res) => {
     return res.status(400).json({ error: 'Missing walletAddress or topicId' });
   }
 
+  const authProblem = sessionTokenProblem(req, walletAddress);
+  if (authProblem) return res.status(401).json({ error: authProblem });
+
   try {
     deleteTopicSubscription(walletAddress, topicId);
   } catch (error) {
@@ -272,6 +317,9 @@ router.post('/messages/clear', async (req, res) => {
     return res.status(400).json({ error: 'Missing walletAddress' });
   }
 
+  const authProblem = sessionTokenProblem(req, walletAddress);
+  if (authProblem) return res.status(401).json({ error: authProblem });
+
   try {
     clearMessages(walletAddress);
   } catch (error) {
@@ -287,6 +335,9 @@ router.post('/messages/delete', async (req, res) => {
   if (!walletAddress) {
     return res.status(400).json({ error: 'Missing walletAddress' });
   }
+
+  const authProblem = sessionTokenProblem(req, walletAddress);
+  if (authProblem) return res.status(401).json({ error: authProblem });
 
   if (Array.isArray(payers) && payers.some(payer => /[,()]/.test(String(payer)))) {
     return res.status(400).json({ error: 'Invalid payer' });
@@ -314,6 +365,9 @@ router.post('/update-filter', async (req, res) => {
   if (!walletAddress || !topicId) {
     return res.status(400).json({ error: 'Missing data' });
   }
+
+  const authProblem = sessionTokenProblem(req, walletAddress);
+  if (authProblem) return res.status(401).json({ error: authProblem });
 
   try {
     if (Array.isArray(requiredNfts)) {
@@ -383,6 +437,9 @@ router.post('/update-preference', async (req, res) => {
   if (!walletAddress || !topicId) {
     return res.status(400).json({ error: 'Missing data' });
   }
+
+  const authProblem = sessionTokenProblem(req, walletAddress);
+  if (authProblem) return res.status(401).json({ error: authProblem });
 
   try {
     updateShowFullMessage({ walletAddress, topicId, showFullMessage });
