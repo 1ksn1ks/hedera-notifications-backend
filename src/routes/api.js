@@ -1,4 +1,5 @@
 import express from 'express';
+import crypto from 'crypto';
 import {
   upsertUser,
   updateTopicDeviceTokens,
@@ -392,7 +393,20 @@ router.post('/update-preference', async (req, res) => {
   res.json({ success: true });
 });
 
-router.get('/debug/topics', async (req, res) => {
+// Debug aid: shows every subscription with its device token, so it is
+// only answered when x-admin-token matches ADMIN_TOKEN. Anything else
+// (including an unset ADMIN_TOKEN) looks like a plain 404.
+router.get('/debug/topics', (req, res) => {
+  const expected = process.env.ADMIN_TOKEN;
+  const given = String(req.headers['x-admin-token'] || '');
+  const authorized =
+    !!expected &&
+    given.length > 0 &&
+    given.length === expected.length &&
+    crypto.timingSafeEqual(Buffer.from(given, 'utf8'), Buffer.from(expected, 'utf8'));
+  if (!authorized) {
+    return res.status(404).json({ error: 'Not found' });
+  }
   try {
     res.json({ data: listAllSubscriptions(), error: null });
   } catch (error) {
