@@ -16,7 +16,8 @@ const CACHE_TTL_MS = 10 * 60 * 1000;
 const MISS_TTL_MS = 60 * 1000;
 const CACHE_LIMIT = 20000;
 const FETCH_TIMEOUT_MS = 8000;
-const MAX_LOOKUPS = 5;
+const MAX_LOOKUPS = 20;
+const MAX_PARALLEL_LOOKUPS = 4;
 const CHECK_BUDGET_MS = 10 * 1000;
 
 export function normalizeRequiredNfts(value) {
@@ -123,25 +124,35 @@ export function createTopicFilter({
     return lookup;
   }
 
-  // Cache hits are free. A message spends at most five mirror lookups and ten seconds.
+  // Cache hits are free. A message spends at most twenty mirror lookups (four
+  // at a time) and ten seconds, stopping at the first token that is held.
   async function holdsAny(accountId, tokenIds) {
     if (!TOKEN_ID.test(accountId)) return false;
     const started = clock();
-    let lookups = 0;
+
+    // Any cached "held" wins immediately and cached "not held" is skipped;
+    // collect the rest for real lookups, capped at MAX_LOOKUPS.
+    const toCheck = [];
     for (const tokenId of tokenIds) {
+      if (toCheck.length >= MAX_LOOKUPS) break;
       if (!TOKEN_ID.test(tokenId)) continue;
       if (clock() - started >= CHECK_BUDGET_MS) return false;
-      const key = `${accountId}\n${tokenId}`;
-      const cached = readCache(key);
+      const cached = readCache(`${accountId}\n${tokenId}`);
       if (cached !== undefined) {
         if (cached) return true;
         continue;
       }
-      if (lookups >= MAX_LOOKUPS) return false;
-      lookups += 1;
-      const holds = await holdsToken(accountId, tokenId);
+      toCheck.push(tokenId);
+    }
+
+    // Resolve in parallel batches of at most four; stop at the first hold.
+    for (let i = 0; i < toCheck.length; i += MAX_PARALLEL_LOOKUPS) {
       if (clock() - started >= CHECK_BUDGET_MS) return false;
-      if (holds) return true;
+      const batch = toCheck.slice(i, i + MAX_PARALLEL_LOOKUPS);
+      const results = await Promise.all(
+        batch.map((tokenId) => holdsToken(accountId, tokenId)),
+      );
+      if (results.some(Boolean)) return true;
     }
     return false;
   }
@@ -175,15 +186,30 @@ export function passesTopicFilter(subscription, sender) {
   return topicFilter.passes(subscription, sender);
 }
 
+const TYPE_CACHE_LIMIT = 5000;
+
 export function createNftTypeCheck({
   fetchImpl = globalThis.fetch,
   mirrorUrl = MIRROR_URL,
   timeoutMs = FETCH_TIMEOUT_MS,
+  cacheLimit = TYPE_CACHE_LIMIT,
 } = {}) {
   const types = new Map();
 
+  // Map insertion order is the age order. Re-set on read so a hit stays fresh,
+  // and drop the oldest entries once the cache passes its cap.
+  function remember(tokenId, type) {
+    if (types.has(tokenId)) types.delete(tokenId);
+    types.set(tokenId, type);
+    while (types.size > cacheLimit) types.delete(types.keys().next().value);
+  }
+
   async function tokenType(tokenId) {
-    if (types.has(tokenId)) return types.get(tokenId);
+    if (types.has(tokenId)) {
+      const type = types.get(tokenId);
+      remember(tokenId, type);
+      return type;
+    }
     const controller = new AbortController();
     let timerId;
     const timeout = new Promise((_, reject) => {
@@ -200,13 +226,13 @@ export function createNftTypeCheck({
       ]);
       if (!res.ok) {
         if (res.status >= 500 || res.status === 429) throw new Error(`HTTP ${res.status}`);
-        types.set(tokenId, '');
+        remember(tokenId, '');
         return '';
       }
       const json = await Promise.race([res.json(), timeout]);
       const type = json && typeof json.type === 'string' ? json.type : '';
       if (!type) throw new Error('Bad token response');
-      types.set(tokenId, type);
+      remember(tokenId, type);
       return type;
     } finally {
       clearTimeout(timerId);
@@ -231,11 +257,15 @@ export function createNftTypeCheck({
     }
   }
 
-  return { assertNftTokens };
+  return { assertNftTokens, isCached: (tokenId) => types.has(tokenId) };
 }
 
 const nftTypes = createNftTypeCheck();
 
 export function assertNftTokens(ids) {
   return nftTypes.assertNftTokens(ids);
+}
+
+export function isNftTypeCached(tokenId) {
+  return nftTypes.isCached(tokenId);
 }

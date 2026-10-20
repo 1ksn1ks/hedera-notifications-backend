@@ -23,9 +23,13 @@ import {
   resolveAccountTopic,
   subscriptionOwner,
 } from '../services/globeCache.js';
-import { assertNftTokens, normalizeRequiredNfts } from '../services/topicFilter.js';
+import { assertNftTokens, isNftTypeCached, normalizeRequiredNfts } from '../services/topicFilter.js';
 
 const router = express.Router();
+
+// A /update-filter call may validate at most this many tokens that are not
+// already in the token-type cache, to bound mirror-node load per request.
+const MAX_NEW_TOKENS_PER_UPDATE = 5;
 
 router.post('/register', async (req, res) => {
   const { deviceToken, platform, walletAddress } = req.body;
@@ -268,11 +272,22 @@ router.post('/update-filter', async (req, res) => {
     if (Array.isArray(requiredNfts)) {
       const normalized = normalizeRequiredNfts(requiredNfts);
       if (!normalized.ok) return res.status(400).json({ error: normalized.error });
+      // Confirm the subscription exists before spending any mirror-node lookups.
       const rows = listSubscriptions(walletAddress);
       const row = Array.isArray(rows) ? rows.find(item => item.topic_id === topicId) : null;
-      const saved = row && Array.isArray(row.required_nfts) ? row.required_nfts : [];
+      if (!row) {
+        return res.status(404).json({ error: 'No such subscription' });
+      }
+      const saved = Array.isArray(row.required_nfts) ? row.required_nfts : [];
       const known = new Set(saved);
-      await assertNftTokens(normalized.ids.filter(id => !known.has(id)));
+      const toCheck = normalized.ids.filter(id => !known.has(id));
+      const uncached = toCheck.filter(id => !isNftTypeCached(id));
+      if (uncached.length > MAX_NEW_TOKENS_PER_UPDATE) {
+        return res.status(400).json({
+          error: `At most ${MAX_NEW_TOKENS_PER_UPDATE} new tokens per update (${uncached.length} requested)`,
+        });
+      }
+      await assertNftTokens(toCheck);
     }
     updateTopicFilter({
       walletAddress,
