@@ -12,8 +12,8 @@
 //    r||s||v over the plain message.
 //
 // Grace period: until GRACE_UNTIL (env: ISO date or epoch ms, default
-// 14 days from boot) unsigned registers are accepted with a warning log.
-// A present-but-invalid proof is always 401.
+// 2026-11-03T00:00:00Z) unsigned registers are accepted with a warning
+// log. A present-but-invalid proof is always 401.
 
 import crypto from 'crypto';
 import { MIRROR_URL } from './globeCache.js';
@@ -21,7 +21,8 @@ import { MIRROR_URL } from './globeCache.js';
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const MAX_PENDING_CHALLENGES = 10000;
 const FETCH_TIMEOUT_MS = 8000;
-const DEFAULT_GRACE_MS = 14 * 24 * 60 * 60 * 1000;
+// Fixed default so a redeploy never pushes the deadline back.
+const DEFAULT_GRACE_UNTIL_MS = Date.parse('2026-11-03T00:00:00Z');
 
 const challenges = new Map(); // account -> { nonce, expiresAt }
 
@@ -40,7 +41,9 @@ export function issueChallenge(account) {
   return nonce;
 }
 
-function parseGraceUntil() {
+// Resolved once at module load. Recomputing it per request would re-read
+// the env and, with a "now + 14 days" default, the window would never close.
+const GRACE_UNTIL_MS = (() => {
   const raw = process.env.GRACE_UNTIL;
   if (raw) {
     const parsed = Date.parse(raw);
@@ -48,15 +51,15 @@ function parseGraceUntil() {
     const ms = Number(raw);
     if (Number.isFinite(ms) && ms > 0) return ms;
   }
-  return Date.now() + DEFAULT_GRACE_MS;
-}
+  return DEFAULT_GRACE_UNTIL_MS;
+})();
 
 export function graceUntil() {
-  return parseGraceUntil();
+  return GRACE_UNTIL_MS;
 }
 
 export function unsignedRegisterAllowed() {
-  return Date.now() < parseGraceUntil();
+  return Date.now() < GRACE_UNTIL_MS;
 }
 
 function fail(message, status) {
