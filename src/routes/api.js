@@ -116,23 +116,26 @@ router.post('/register', async (req, res) => {
     }
   }
 
-  // Issued on every successful register (signed, or unsigned during grace):
-  // the client keeps it and presents it on the wallet-owned writes.
-  const sessionToken = crypto.randomBytes(32).toString('base64url');
   try {
     upsertUser({ walletAddress, deviceToken, platform: platform || 'android' });
     updateTopicDeviceTokens(walletAddress, deviceToken);
-    saveSessionToken(
-      walletAddress,
-      deviceToken,
-      crypto.createHash('sha256').update(sessionToken).digest('hex')
-    );
+    // Only a signed register mints a session token: an unsigned grace
+    // register must not leave a token that outlives the deadline.
+    if (!unsigned) {
+      const sessionToken = crypto.randomBytes(32).toString('base64url');
+      saveSessionToken(
+        walletAddress,
+        deviceToken,
+        crypto.createHash('sha256').update(sessionToken).digest('hex')
+      );
+      return res.json({ success: true, token: sessionToken });
+    }
   } catch (error) {
     console.error(error);
     return res.status(500).json({ error: error.message });
   }
 
-  res.json({ success: true, token: sessionToken });
+  res.json({ success: true });
 });
 
 router.post('/subscribe', async (req, res) => {

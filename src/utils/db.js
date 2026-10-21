@@ -101,6 +101,29 @@ export function ensureTopicSubscriptionColumns(database) {
 
 ensureTopicSubscriptionColumns(db);
 
+// The register grace period has ended: a token minted by a pre-deadline
+// unsigned register must not survive. Clear the table once at startup —
+// signed clients re-register (and get a fresh token) when their 401 hits.
+// Deferred past module evaluation: registerChallenge.js (via globeCache.js)
+// reads dbPath from this file at its top level, so a static import would
+// crash the startup cycle. setImmediate still fires before any request.
+setImmediate(async () => {
+  try {
+    const { unsignedRegisterAllowed } = await import(
+      '../services/registerChallenge.js'
+    );
+    if (unsignedRegisterAllowed()) return;
+    const result = db.prepare('DELETE FROM session_tokens').run();
+    if (result.changes > 0) {
+      console.log(
+        `cleared ${result.changes} session token(s) now that the register grace period has ended`
+      );
+    }
+  } catch (error) {
+    console.error('session token cleanup failed:', error.message);
+  }
+});
+
 console.log(`SQLite ready at ${dbPath}`);
 
 function now() {
