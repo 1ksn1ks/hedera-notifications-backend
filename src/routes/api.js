@@ -414,6 +414,9 @@ router.post('/update-filter', async (req, res) => {
 router.get('/subscriptions/:walletAddress', async (req, res) => {
   const walletAddress = req.params.walletAddress;
 
+  const authProblem = sessionTokenProblem(req, walletAddress);
+  if (authProblem) return res.status(401).json({ error: authProblem });
+
   let data;
   try {
     data = listSubscriptions(walletAddress);
@@ -476,6 +479,9 @@ router.get('/debug/topics', (req, res) => {
 
 router.get('/messages/:walletAddress', async (req, res) => {
   const { walletAddress } = req.params;
+
+  const authProblem = sessionTokenProblem(req, walletAddress);
+  if (authProblem) return res.status(401).json({ error: authProblem });
 
   let data;
   try {
