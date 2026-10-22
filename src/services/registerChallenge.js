@@ -1,7 +1,8 @@
 // Register challenge: prove the caller owns the wallet before a device
 // token is saved for it. The client fetches a nonce, has the connected
-// wallet sign it, and posts nonce + signature with the register call.
-// Nonces live in memory, expire after five minutes, and are single use.
+// wallet sign the readable message (older apps sign the bare nonce), and
+// posts nonce + signature with the register call. Nonces live in memory,
+// expire after five minutes, and are single use.
 //
 // Signature formats accepted:
 //  - signatureMap: the base64 protobuf SignatureMap returned by
@@ -41,6 +42,12 @@ export function issueChallenge(account) {
   const nonce = crypto.randomBytes(16).toString('hex');
   challenges.set(nonce, { account, expiresAt: now + CHALLENGE_TTL_MS });
   return nonce;
+}
+
+// The wallet signs this sentence. The challenge response sends the same
+// text in "message" so the app does not assemble it itself.
+export function registerMessage(account, nonce) {
+  return `Hedera Notifier register ${account} nonce ${nonce}`;
 }
 
 // Resolved once at module load. Recomputing it per request would re-read
@@ -280,6 +287,15 @@ function derSignature(rs64) {
   return Buffer.concat([Buffer.from([0x30, r.length + s.length]), r, s]);
 }
 
+function signedForms(text) {
+  const plain = Buffer.from(text, 'utf8');
+  const prefixed = Buffer.concat([
+    Buffer.from('\x19Hedera Signed Message:\n' + plain.length, 'utf8'),
+    plain,
+  ]);
+  return [prefixed, plain];
+}
+
 function checkSignature(keyObject, accountKey, sig, message) {
   if (accountKey.type === 'ED25519PublicKey') {
     if (sig.length !== 64) return false;
@@ -315,14 +331,13 @@ export async function verifyWalletSignature(
   const keyObject = keyObjectFor(key);
   if (!keyObject) throw fail("Cannot verify this account's key", 401);
 
-  // The wallet signs the nonce the client sent it (its ASCII bytes),
-  // with or without the HIP-820 prefix — accept either.
-  const plain = Buffer.from(String(nonce), 'utf8');
-  const prefixed = Buffer.concat([
-    Buffer.from('\x19Hedera Signed Message:\n' + plain.length, 'utf8'),
-    plain,
-  ]);
-  const messages = [prefixed, plain];
+  // Readable message first, then the bare nonce the previous app signed.
+  // HIP-820 prefixes the bytes with "\x19Hedera Signed Message:\n" + length,
+  // so each text is tried with that prefix and without it.
+  const messages = [
+    ...signedForms(registerMessage(account, nonce)),
+    ...signedForms(String(nonce)),
+  ];
 
   // Candidate signatures: the decoded SignatureMap (when the input is one)
   // plus the legacy raw-hex interpretation.

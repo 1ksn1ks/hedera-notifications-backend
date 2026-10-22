@@ -29,6 +29,7 @@ import {
 import { assertNftTokens, isNftTypeCached, normalizeRequiredNfts } from '../services/topicFilter.js';
 import {
   issueChallenge,
+  registerMessage,
   verifyWalletSignature,
   unsignedRegisterAllowed,
   graceUntil,
@@ -78,7 +79,8 @@ router.get('/register/challenge', (req, res) => {
   }
 
   try {
-    return res.json({ nonce: issueChallenge(account) });
+    const nonce = issueChallenge(account);
+    return res.json({ nonce, message: registerMessage(account, nonce) });
   } catch (error) {
     return res.status(error.status || 500).json({ error: error.message });
   }
