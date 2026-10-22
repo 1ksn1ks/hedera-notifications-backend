@@ -1,6 +1,6 @@
 // Cached public Hedera Globe data. The phone reads this process.
-// A mirror walk refills an empty directory, and keeps follow pairs for when
-// Globe's following route is unavailable.
+// A mirror walk refills an empty directory, and keeps follow pairs and
+// profile topics for when Globe's following route is unavailable.
 import fs from 'fs';
 import path from 'path';
 import { backfillViaAccounts, dbPath } from '../utils/db.js';
@@ -54,6 +54,20 @@ function objectMap(value) {
   return value;
 }
 
+function profileLinksFrom(value) {
+  const out = {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
+  for (const [id, row] of Object.entries(value)) {
+    if (!ACCOUNT_ID.test(id) || !row || typeof row !== 'object') continue;
+    const topic = typeof row.topic === 'string' ? row.topic.trim() : '';
+    out[id] = {
+      topic: TOPIC_ID.test(topic) ? topic : '',
+      seq: Math.max(0, Math.floor(Number(row.seq) || 0)),
+    };
+  }
+  return out;
+}
+
 function emptyState() {
   return {
     version: 1,
@@ -61,6 +75,8 @@ function emptyState() {
     directory: { generation: '', revision: 0, accounts: {} },
     followSeq: 0,
     followPairs: {},
+    profileSeq: 0,
+    profileLinks: {},
     following: {},
   };
 }
@@ -116,6 +132,8 @@ export function createGlobeCache({
         },
         followSeq: Math.max(0, Math.floor(Number(parsed.followSeq) || 0)),
         followPairs: objectMap(parsed.followPairs),
+        profileSeq: Math.max(0, Math.floor(Number(parsed.profileSeq) || 0)),
+        profileLinks: profileLinksFrom(parsed.profileLinks),
         following: objectMap(parsed.following),
       };
     } catch (err) {
@@ -331,6 +349,68 @@ export function createGlobeCache({
     }
   }
 
+  // Profile topic 0.0.9759201. { data: { profileTopic } } sets,
+  // { data: { clearProfileTopic: "1" } } clears. The newest message for
+  // an account wins. The next read starts after the last sequence.
+  function applyProfile(msg) {
+    if (!msg || typeof msg !== 'object') return false;
+    let changed = false;
+    const seq = Number(msg.sequence_number);
+    if (Number.isFinite(seq) && seq > state.profileSeq) {
+      state.profileSeq = seq;
+      changed = true;
+    }
+    const payer = msg.payer_account_id;
+    if (typeof payer !== 'string' || !ACCOUNT_ID.test(payer)) return changed;
+    let parsed;
+    try {
+      parsed = JSON.parse(Buffer.from(msg.message, 'base64').toString('utf8'));
+    } catch {
+      return changed;
+    }
+    const data = parsed && typeof parsed === 'object' ? parsed.data : null;
+    const action = profileTopicAction(data);
+    if (!action || !Number.isFinite(seq)) return changed;
+    const prev = state.profileLinks[payer];
+    if (prev && seq < prev.seq) return changed;
+    state.profileLinks[payer] = {
+      topic: action.action === 'set' ? action.topic : '',
+      seq,
+    };
+    return true;
+  }
+
+  async function pullProfiles() {
+    let next = `/api/v1/topics/${BIO_TOPIC}/messages?limit=100&order=asc&sequencenumber=gt:${state.profileSeq}`;
+    let pages = 0;
+    let changed = false;
+    try {
+      while (next && pages < pageCap) {
+        const url = next.startsWith('http') ? next : `${mirrorUrl}${next}`;
+        const json = await fetchJson(url, jobTimeoutMs);
+        for (const msg of json.messages || []) {
+          if (applyProfile(msg)) changed = true;
+        }
+        next = json.links && json.links.next ? String(json.links.next) : '';
+        pages += 1;
+      }
+    } catch (err) {
+      if (changed) {
+        state.builtAt = now();
+        persist();
+      }
+      warn(`Globe profile mirror read stopped early; keeping the links already applied. ${errorText(err)}`);
+      return;
+    }
+    if (next) {
+      warn('Globe profile topic was cut off; the next refresh continues from the last sequence.');
+    }
+    if (changed) {
+      state.builtAt = now();
+      persist();
+    }
+  }
+
   async function doRefresh() {
     let settingsOk = false;
     try {
@@ -349,6 +429,11 @@ export function createGlobeCache({
       await pullFollows();
     } catch (err) {
       warn(`Globe follow mirror read failed; keeping the previous pairs. ${errorText(err)}`);
+    }
+    try {
+      await pullProfiles();
+    } catch (err) {
+      warn(`Globe profile mirror read failed; keeping the previous links. ${errorText(err)}`);
     }
     backfillOwnersOnce();
   }
@@ -424,13 +509,37 @@ export function createGlobeCache({
 
   indexDirectory();
 
+  function profileTopicOf(accountId) {
+    const row = state.profileLinks[accountId];
+    if (!row) return null;
+    return TOPIC_ID.test(row.topic) ? row.topic : '';
+  }
+
+  // The account whose newest profile link still points at this topic.
+  function ownerOfTopic(topicId) {
+    if (typeof topicId !== 'string' || !TOPIC_ID.test(topicId)) return '';
+    let owner = '';
+    let best = -1;
+    for (const [accountId, row] of Object.entries(state.profileLinks)) {
+      if (!row || row.topic !== topicId) continue;
+      const seq = Number(row.seq) || 0;
+      if (seq >= best) {
+        best = seq;
+        owner = accountId;
+      }
+    }
+    return owner;
+  }
+
   function present(accounts, topics, source) {
     return {
       accounts: (accounts || []).map((account) => ({
         id: String(account.id || ''),
         username: account.username || '',
         avatar: account.avatar || '',
-        topic: topicFor(account.id),
+        topic: typeof account.topic === 'string'
+          ? (TOPIC_ID.test(account.topic) ? account.topic : '')
+          : topicFor(account.id),
       })),
       topics: (topics || []).map((topic) => ({
         id: String(topic.id || ''),
@@ -447,16 +556,36 @@ export function createGlobeCache({
     return entry;
   }
 
+  function withCurrentTopic(accounts) {
+    return (accounts || []).map((account) => {
+      const topic = profileTopicOf(account.id);
+      if (topic == null) return account;
+      return { ...account, topic };
+    });
+  }
+
   function mirrorFollowing(account) {
     const ids = Array.isArray(state.followPairs[account]) ? state.followPairs[account] : [];
-    return ids.map((id) => {
-      const row = state.directory.accounts[id] || {};
-      return {
-        id,
+    const seen = new Set();
+    const accounts = [];
+    for (const id of ids) {
+      if (typeof id !== 'string') continue;
+      // An old follow of a topic becomes a follow of whoever holds it now.
+      const owner = ownerOfTopic(id);
+      const accountId = owner || id;
+      if (seen.has(accountId)) continue;
+      seen.add(accountId);
+      const row = state.directory.accounts[accountId] || {};
+      const topic = profileTopicOf(accountId);
+      const item = {
+        id: accountId,
         username: row.username || '',
         avatar: row.profilePic || '',
       };
-    });
+      if (topic != null) item.topic = topic;
+      accounts.push(item);
+    }
+    return accounts;
   }
 
   async function getFollowing(account) {
@@ -493,7 +622,7 @@ export function createGlobeCache({
     } catch (err) {
       warn(`Globe following lookup failed. ${errorText(err)}`);
     }
-    if (entry) return present(entry.accounts, entry.topics, 'cache');
+    if (entry) return present(withCurrentTopic(entry.accounts), entry.topics, 'cache');
     return present(mirrorFollowing(account), [], 'mirror');
   }
 

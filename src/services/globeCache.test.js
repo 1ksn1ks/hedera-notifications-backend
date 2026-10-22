@@ -155,7 +155,10 @@ test('a cut-off bio walk does not replace the directory', async () => {
     });
     await cache.refresh();
     assert.equal(cache.resolveAccountTopic('0.0.2'), '');
-    assert.equal(fs.existsSync(file), false);
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.deepEqual(saved.directory.accounts, {});
+    assert.equal(saved.profileLinks['0.0.2'].topic, '0.0.200');
+    assert.equal(saved.profileSeq, 1);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -179,8 +182,14 @@ test('user settings merge on the same generation and replace when it changes', a
       settingsUrls.push(u);
       return jsonResponse({ ready, generation, revision, settings });
     }
-    if (u.includes('0.0.9759201')) {
+    if (u.includes('0.0.9759201') && !u.includes('sequencenumber=')) {
       bioCalls += 1;
+      return jsonResponse({
+        messages: [bioMessage('0.0.8', { profileTopic: '0.0.8' })],
+        links: {},
+      });
+    }
+    if (u.includes('0.0.9759201')) {
       return jsonResponse({
         messages: [bioMessage('0.0.8', { profileTopic: '0.0.8' })],
         links: {},
@@ -205,6 +214,9 @@ test('user settings merge on the same generation and replace when it changes', a
     assert.equal(cache.directoryEntry('0.0.2').username, 'two');
     assert.equal(cache.directoryEntry('1.2.3'), null);
     assert.equal(bioCalls, 0);
+    const indexed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(indexed.profileLinks['0.0.8'].topic, '0.0.8');
+    assert.equal(indexed.directory.accounts['0.0.8'], undefined);
     const first = new URL(settingsUrls[0]);
     assert.equal(first.searchParams.get('after_rev'), '0');
     assert.equal(first.searchParams.get('generation'), null);
@@ -351,6 +363,177 @@ test('getFollowing uses memory, then Globe, then the saved copy, then mirror pai
 
     await cache.refresh();
     assert.equal(followUrls.at(-1).includes('sequencenumber=gt:10'), true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fallback following returns profile topics and converts topic follows', async () => {
+  const { dir, file } = tempFile();
+  let nowMs = 1_000_000;
+  let followingStatus = 200;
+  const bioUrls = [];
+  const followUrls = [];
+  let fullBio = 0;
+  const fetchImpl = async (url) => {
+    const u = String(url);
+    const seq = new URL(u).searchParams.get('sequencenumber') || '';
+    if (u.includes('/api/following')) {
+      if (followingStatus !== 200) return jsonResponse({}, followingStatus);
+      return jsonResponse({
+        ok: true,
+        accounts: [
+          { id: '0.0.5', username: 'ann', avatar: 'a.png' },
+          { id: '0.0.6', username: 'ben', avatar: 'b.png' },
+        ],
+        topics: [{ id: '0.0.9', name: 'Cafe' }],
+      });
+    }
+    if (u.includes('/api/user-settings')) {
+      return jsonResponse({
+        ready: true,
+        generation: 'g',
+        revision: 1,
+        settings: [
+          { accountId: '0.0.5', username: 'five', profilePic: 'five.png', topic: '0.0.70' },
+          { accountId: '0.0.6', username: 'six', profilePic: 'six.png', topic: '0.0.71' },
+          { accountId: '0.0.7', username: 'seven', profilePic: 'seven.png', topic: '0.0.72' },
+        ],
+      });
+    }
+    if (u.includes('0.0.9759201')) {
+      bioUrls.push(u);
+      if (!seq) {
+        fullBio += 1;
+        return jsonResponse({ messages: [], links: {} });
+      }
+      if (seq === 'gt:7') {
+        return jsonResponse({
+          messages: [
+            bioMessage('0.0.6', { profileTopic: '0.0.601' }, 8),
+            bioMessage('0.0.9', { profileTopic: '0.0.900' }, 9),
+          ],
+          links: {},
+        });
+      }
+      return jsonResponse({
+        messages: [
+          bioMessage('0.0.5', { profileTopic: '0.0.500' }, 1),
+          bioMessage('0.0.8', { profileTopic: '0.0.502' }, 2),
+          bioMessage('0.0.5', { profileTopic: '0.0.502' }, 4),
+          bioMessage('0.0.5', { profileTopic: '0.0.501' }, 3),
+          bioMessage('0.0.6', { profileTopic: '0.0.600' }, 5),
+          bioMessage('0.0.6', { clearProfileTopic: '1' }, 6),
+          bioMessage('0.0.4', { topic_bio: 'nope' }, 7),
+        ],
+        links: {},
+      });
+    }
+    if (u.includes('0.0.10923187')) {
+      followUrls.push(u);
+      if (seq === 'gt:0') {
+        return jsonResponse({
+          messages: [
+            followMessage('0.0.1', { follow: '0.0.5' }, 1),
+            followMessage('0.0.1', { follow: '0.0.502' }, 2),
+            followMessage('0.0.1', { follow: '0.0.6' }, 3),
+            followMessage('0.0.2', { follow: '0.0.502' }, 4),
+            followMessage('0.0.2', { follow: '0.0.7' }, 5),
+            followMessage('0.0.3', { follow: '0.0.999' }, 6),
+          ],
+          links: {},
+        });
+      }
+      if (seq === 'gt:6') {
+        return jsonResponse({
+          messages: [followMessage('0.0.1', { follow: '0.0.9' }, 9)],
+          links: {},
+        });
+      }
+      return jsonResponse({ messages: [], links: {} });
+    }
+    return jsonResponse({ messages: [], links: {} });
+  };
+  try {
+    const cache = createGlobeCache({
+      fetchImpl,
+      cacheFile: file,
+      clock: () => nowMs,
+      listProfiles: async () => ({}),
+      warn: () => {},
+      mirrorUrl: 'https://mirror.test',
+      globeUrl: 'https://globe.test',
+    });
+    await cache.refresh();
+    assert.equal(fullBio, 0);
+    assert.equal(bioUrls[0].includes('sequencenumber=gt:0'), true);
+    assert.equal(followUrls[0].includes('sequencenumber=gt:0'), true);
+
+    const globe = await cache.getFollowing('0.0.4');
+    assert.equal(globe.source, 'globe');
+    assert.deepEqual(globe.accounts, [
+      { id: '0.0.5', username: 'ann', avatar: 'a.png', topic: '0.0.70' },
+      { id: '0.0.6', username: 'ben', avatar: 'b.png', topic: '0.0.71' },
+    ]);
+    assert.deepEqual(globe.topics, [{ id: '0.0.9', name: 'Cafe' }]);
+
+    const fresh = await cache.getFollowing('0.0.4');
+    assert.equal(fresh.source, 'cache');
+    assert.equal(fresh.accounts[0].topic, '0.0.70');
+    assert.equal(fresh.accounts[1].topic, '0.0.71');
+
+    nowMs += 5 * 60 * 1000;
+    followingStatus = 503;
+    const stale = await cache.getFollowing('0.0.4');
+    assert.equal(stale.source, 'cache');
+    assert.deepEqual(stale.accounts, [
+      { id: '0.0.5', username: 'ann', avatar: 'a.png', topic: '0.0.502' },
+      { id: '0.0.6', username: 'ben', avatar: 'b.png', topic: '' },
+    ]);
+    assert.deepEqual(stale.topics, [{ id: '0.0.9', name: 'Cafe' }]);
+
+    const first = await cache.getFollowing('0.0.1');
+    assert.equal(first.source, 'mirror');
+    assert.deepEqual(first.topics, []);
+    assert.deepEqual(first.accounts, [
+      { id: '0.0.5', username: 'five', avatar: 'five.png', topic: '0.0.502' },
+      { id: '0.0.6', username: 'six', avatar: 'six.png', topic: '' },
+    ]);
+    const second = await cache.getFollowing('0.0.2');
+    assert.deepEqual(second.accounts, [
+      { id: '0.0.5', username: 'five', avatar: 'five.png', topic: '0.0.502' },
+      { id: '0.0.7', username: 'seven', avatar: 'seven.png', topic: '0.0.72' },
+    ]);
+    assert.deepEqual(second.topics, []);
+    const third = await cache.getFollowing('0.0.3');
+    assert.deepEqual(third.accounts, [
+      { id: '0.0.999', username: '', avatar: '', topic: '' },
+    ]);
+
+    await cache.refresh();
+    assert.equal(bioUrls.at(-1).includes('sequencenumber=gt:7'), true);
+    assert.equal(followUrls.at(-1).includes('sequencenumber=gt:6'), true);
+    const resumed = await cache.getFollowing('0.0.1');
+    assert.equal(resumed.source, 'mirror');
+    assert.deepEqual(resumed.accounts, [
+      { id: '0.0.5', username: 'five', avatar: 'five.png', topic: '0.0.502' },
+      { id: '0.0.6', username: 'six', avatar: 'six.png', topic: '0.0.601' },
+      { id: '0.0.9', username: '', avatar: '', topic: '0.0.900' },
+    ]);
+    assert.deepEqual(resumed.topics, []);
+
+    const loaded = createGlobeCache({
+      fetchImpl: async () => {
+        throw new Error('offline');
+      },
+      cacheFile: file,
+      warn: () => {},
+      mirrorUrl: 'https://mirror.test',
+      globeUrl: 'https://globe.test',
+    });
+    const fromDisk = await loaded.getFollowing('0.0.1');
+    assert.deepEqual(fromDisk.accounts, resumed.accounts);
+    assert.equal(fromDisk.source, 'mirror');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
